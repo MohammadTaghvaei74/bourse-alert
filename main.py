@@ -7,7 +7,7 @@ DB_PATH = "/root/bourse-alert/scores_history.db"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8682677437:AAFYCBWrpyHUMb6Dixhh9DdMUwUZemYLplc")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004419199993")
 
-LEVERAGED_FUNDS = ["اهرم", "شتاب", "موج", "جهش", "توان", "نارنج", "بیدار", "عیار"]
+LEVERAGED_FUNDS = ["اهرم", "شتاب", "موج", "جهش", "توان", "نارنج", "بیدار", ]
 LEADERS = ["ذوب", "اهرم", "فملی", "فولاد", "تاپیکو", "شستا", "شبریز", "شتران", "وغدیر", "شپنا", "شبندر", "پالایش", "خگستر", "فارس", "خودرو", "وبصادر", "وبملت", "خساپا", "دارا یکم", "پارسان", "وتجارت"]
 
 def init_db():
@@ -190,7 +190,11 @@ def run_pipeline():
 
         leveraged_list = [stock_dict[sym] for sym in LEVERAGED_FUNDS if sym in stock_dict]
         leveraged_list.sort(key=lambda x: x["score"], reverse=True)
-        msg_lev = "<b>#اهرمی - رتبه‌بندی صندوق‌های اهرمی</b>\n\n"
+        # محاسبه میانگین صندوق‌های اهرمی
+avg_leverage = sum([item["score"] for item in leverage_data]) / len(leverage_data) if leverage_data else 0
+avg_leverage = sum([item["score"] for item in leverage_data]) / len(leverage_data) if leverage_data else 0
+avg_leverage = sum([item["score"] for item in leverage_data]) / len(leverage_data) if leverage_data else 0
+msg_lev = f"<b>#اهرمی - رتبه‌بندی صندوق‌های اهرمی</b>\nمیانگین: {avg_leverage:.1f}\n\n"
         for idx, s in enumerate(leveraged_list, 1):
             msg_lev += f"{idx}. {s['symbol']} | <b>{s['score']:.1f}</b> {get_symbol_stats(s['symbol'], s['score'])}\n"
 
