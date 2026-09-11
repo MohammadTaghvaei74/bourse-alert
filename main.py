@@ -1,96 +1,129 @@
-import os
-import time
-import datetime
-import threading
-import pytz
-import requests
-import logging
-from flask import Flask
+import os, sys, time, logging, sqlite3, requests
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# وب‌سرور سبک برای زنده نگه داشتن سرویس
-app = Flask(__name__)
+DB_PATH = "/root/bourse-alert/scores_history.db"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8682677437:AAFYCBWrpyHUMb6Dixhh9DdMUwUZemYLplc")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004419199993")
 
-@app.route('/')
-def home():
-    return "Bourse Alert Bot is active and running!"
+LEVERAGED_FUNDS = ["اهرم", "شتاب", "موج", "جهش", "توان", "نارنج", "بیدار", "عیار"]
+LEADERS = ["ذوب", "اهرم", "فملی", "فولاد", "تاپیکو", "شستا", "شبریز", "شتران", "وغدیر", "شپنا", "شبندر", "پالایش", "خگستر", "فارس", "خودرو", "وبصادر", "وبملت", "خساپا", "دارا یکم", "پارسان", "وتجارت"]
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-# اطلاعات ربات و کانال
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8682677437:AAFYCBWrpyHUMb6Dixhh9DdMUwUZemYLplc")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bourse_alert_live")
-PROXY_URL = os.getenv("TELEGRAM_PROXY", "")
-
-# فهرست نمادها
-LEVERAGED_FUNDS = ["موج", "اهرم", "دوایکس", "نارنج اهرم", "جهش", "شتاب", "بیدار"]
-LEADERS = [
-    "اهرم", "فولاد", "تاپیکو", "فملی", "شستا", "ذوب", "شبریز", "شتران", 
-    "وغدیر", "شپنا", "شبندر", "پالایش", "خگستر", "فارس", "خودرو", 
-    "وبصادر", "خساپا", "وتجارت", "وبملت", "پارسان", "دارا یکم"
-]
-
-previous_scores = {}
-
-def get_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    })
-    return s
-
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+def init_db():
     try:
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        resp = requests.post(url, json=payload, proxies=proxies, timeout=15)
-        if resp.status_code != 200:
-            logging.error(f"Telegram Error ({resp.status_code}): {resp.text}")
-        else:
-            logging.info("Telegram message sent successfully.")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS history (symbol TEXT, score REAL, timestamp DATETIME)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sym_time ON history(symbol, timestamp)")
     except Exception as e:
-        logging.error(f"Error sending telegram message: {e}")
+        logging.error(f"DB init error: {e}")
+
+def save_scores(stocks):
+    try:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            data = [(s["symbol"], s["score"], now) for s in stocks]
+            conn.executemany("INSERT INTO history VALUES (?, ?, ?)", data)
+            week_ago = now - timedelta(days=7)
+            conn.execute("DELETE FROM history WHERE timestamp < ?", (week_ago,))
+    except Exception as e:
+        logging.error(f"DB save error: {e}")
+
+def get_symbol_stats(symbol, current_score):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT score FROM history WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1 OFFSET 1", (symbol,))
+            last_row = cursor.fetchone()
+            d_last = (current_score - last_row[0]) if last_row else 0.0
+
+            cursor.execute("SELECT DISTINCT date(timestamp) FROM history WHERE symbol = ? ORDER BY date(timestamp) DESC", (symbol,))
+            dates = [r[0] for r in cursor.fetchall()]
+
+            d_prev_day = 0.0
+            if len(dates) >= 2:
+                cursor.execute("SELECT AVG(score) FROM history WHERE symbol = ? AND date(timestamp) = ?", (symbol, dates[1]))
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    d_prev_day = current_score - row[0]
+
+            d_5d = 0.0
+            past_dates = dates[1:6]
+            if past_dates:
+                ph = ",".join(["?"] * len(past_dates))
+                cursor.execute(f"SELECT AVG(score) FROM history WHERE symbol = ? AND date(timestamp) IN ({ph})", [symbol] + past_dates)
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    d_5d = current_score - row[0]
+
+            fmt = lambda val: f"{val:+.1f}" if val != 0 else "0.0"
+            return f"(گ قبل: {fmt(d_last)} | دیروز: {fmt(d_prev_day)} | ۵‌روزه: {fmt(d_5d)})"
+    except Exception as e:
+        return "(گ قبل: 0.0 | دیروز: 0.0 | ۵‌روزه: 0.0)"
+
+def get_leaders_overall_stats(leaders_list):
+    if not leaders_list:
+        return ""
+    avg_score = sum(s["score"] for s in leaders_list) / len(leaders_list)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            symbols = [s["symbol"] for s in leaders_list]
+            ph = ",".join(["?"] * len(symbols))
+            cursor.execute(f"SELECT AVG(score) FROM (SELECT score, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) as rn FROM history WHERE symbol IN ({ph})) WHERE rn = 2", symbols)
+            row = cursor.fetchone()
+            d_last = (avg_score - row[0]) if (row and row[0] is not None) else 0.0
+
+            cursor.execute(f"SELECT DISTINCT date(timestamp) FROM history WHERE symbol IN ({ph}) ORDER BY date(timestamp) DESC", symbols)
+            dates = [r[0] for r in cursor.fetchall()]
+
+            d_prev_day = 0.0
+            if len(dates) >= 2:
+                cursor.execute(f"SELECT AVG(score) FROM history WHERE symbol IN ({ph}) AND date(timestamp) = ?", symbols + [dates[1]])
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    d_prev_day = avg_score - row[0]
+
+            d_5d = 0.0
+            past_dates = dates[1:6]
+            if past_dates:
+                d_ph = ",".join(["?"] * len(past_dates))
+                cursor.execute(f"SELECT AVG(score) FROM history WHERE symbol IN ({ph}) AND date(timestamp) IN ({d_ph})", symbols + past_dates)
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    d_5d = avg_score - row[0]
+
+            fmt = lambda val: f"{val:+.1f}" if val != 0 else "0.0"
+            return f"📊 <b>میانگین: {avg_score:.1f}</b> (گ قبل: {fmt(d_last)} | دیروز: {fmt(d_prev_day)} | ۵‌روزه: {fmt(d_5d)})\n\n"
+    except Exception as e:
+        return f"📊 <b>میانگین: {avg_score:.1f}</b>\n\n"
+
+def is_derivative(symbol):
+    prefixes = ["ض", "ط", "ص", "هـ", "سکه"]
+    return any(symbol.startswith(p) for p in prefixes) and any(char.isdigit() for char in symbol)
 
 def fetch_market_data():
     url = "http://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx"
-    session = get_session()
-    try:
-        res = session.get(url, timeout=15)
-        if res.status_code != 200 or not res.text:
-            logging.warning(f"TSETMC returned invalid response: status {res.status_code}")
-            return None, None
-        parts = res.text.split("@")
-        stocks_raw = parts[2].split(";") if len(parts) > 2 else []
-        depth_raw = parts[3].split(";") if len(parts) > 3 else []
-        return stocks_raw, depth_raw
-    except Exception as e:
-        logging.error(f"Failed to fetch market data: {e}")
-        return None, None
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    parts = resp.text.split("@")
+    return (parts[2].split(";") if len(parts) > 2 else []), (parts[3].split(";") if len(parts) > 3 else [])
 
 def parse_market_data(stocks_raw, depth_raw):
-    queues = {}
+    quotes = {}
     for d in depth_raw:
         item = d.split(",")
         if len(item) >= 8:
             ins_id = item[0]
-            buy_vol = float(item[4]) if item[4] else 0.0
-            buy_price = float(item[5]) if item[5] else 0.0
-            sell_price = float(item[6]) if item[6] else 0.0
-            sell_vol = float(item[7]) if item[7] else 0.0
-            if ins_id not in queues:
-                queues[ins_id] = {
-                    "best_buy_vol": buy_vol, "best_buy_price": buy_price,
-                    "best_sell_price": sell_price, "best_sell_vol": sell_vol
-                }
+            try:
+                b_price, s_price = float(item[4] or 0), float(item[5] or 0)
+                b_vol, s_vol = float(item[6] or 0), float(item[7] or 0)
+            except Exception:
+                continue
+            if ins_id not in quotes:
+                quotes[ins_id] = []
+            quotes[ins_id].append({"b_price": b_price, "s_price": s_price, "b_vol": b_vol, "s_vol": s_vol})
 
     stocks = []
     for s in stocks_raw:
@@ -100,167 +133,103 @@ def parse_market_data(stocks_raw, depth_raw):
         try:
             ins_id = fields[0]
             symbol = fields[2].replace("ي", "ی").replace("ك", "ک").strip()
-            yesterday_price = float(fields[5]) if fields[5] else 0.0
-            last_price = float(fields[7]) if fields[7] else 0.0
-            trade_vol = float(fields[9]) if fields[9] else 0.0
-            trade_val = float(fields[10]) if fields[10] else 0.0
-            min_allowed = float(fields[19]) if fields[19] else 0.0
-            max_allowed = float(fields[20]) if fields[20] else 0.0
+            yesterday_price = float(fields[13] or 0)
+            close_price = float(fields[6] or 0)
+            last_price = float(fields[7] or 0)
+            trade_vol = float(fields[9] or 0)
+            trade_val = float(fields[10] or 0)
+            p19, p20 = float(fields[19] or 0), float(fields[20] or 0)
+            max_allowed, min_allowed = max(p19, p20), min(p19, p20)
             sector_code = fields[18] if len(fields) > 18 else "سایر"
 
-            if yesterday_price <= 0:
+            if is_derivative(symbol) or yesterday_price <= 0:
                 continue
 
+            close_pct = round(((close_price - yesterday_price) / yesterday_price) * 100, 2)
             last_pct = round(((last_price - yesterday_price) / yesterday_price) * 100, 2)
-            depth = queues.get(ins_id, {})
-            best_buy_p = depth.get("best_buy_price", 0)
-            best_buy_v = depth.get("best_buy_vol", 0)
-            best_sell_p = depth.get("best_sell_price", 0)
-            best_sell_v = depth.get("best_sell_vol", 0)
 
-            score = last_pct
+            order_rows = quotes.get(ins_id, [])
+            best_buy_p = max([r["b_price"] for r in order_rows], default=0.0)
+            best_sell_p = min([r["s_price"] for r in order_rows if r["s_price"] > 0], default=0.0)
+
+            total_buy_queue_vol = sum(r["b_vol"] for r in order_rows if max_allowed > 0 and r["b_price"] >= (max_allowed - 1))
+            total_sell_queue_vol = sum(r["s_vol"] for r in order_rows if min_allowed > 0 and r["s_price"] <= (min_allowed + 1) and r["s_price"] > 0)
             effective_vol = max(trade_vol, 50000.0)
 
-            if max_allowed > 0 and best_buy_p >= max_allowed and best_buy_v > 0:
-                queue_factor = min(best_buy_v / effective_vol, 15.0)
-                score += queue_factor
-            elif min_allowed > 0 and best_sell_p <= min_allowed and best_sell_v > 0:
-                queue_factor = min(best_sell_v / effective_vol, 15.0)
-                score -= queue_factor
+            is_buy_queue = (total_buy_queue_vol > 0) and (best_buy_p >= (max_allowed - 1))
+            is_sell_queue = (total_sell_queue_vol > 0) and (best_sell_p <= (min_allowed + 1) and best_sell_p > 0)
 
-            stocks.append({
-                "symbol": symbol,
-                "score": round(score, 2),
-                "last_pct": last_pct,
-                "trade_val": trade_val,
-                "sector": sector_code,
-            })
+            if is_buy_queue:
+                score = last_pct + round(total_buy_queue_vol / effective_vol, 2)
+            elif is_sell_queue:
+                score = last_pct - round(total_sell_queue_vol / effective_vol, 2)
+            else:
+                score = last_pct
+
+            stocks.append({"symbol": symbol, "score": round(score, 2), "last_pct": last_pct, "close_pct": close_pct, "trade_val": trade_val, "trade_vol": trade_vol, "sector": sector_code, "buy_queue_vol": total_buy_queue_vol, "sell_queue_vol": total_sell_queue_vol})
         except Exception:
             continue
-
     return stocks
 
-def format_delta(current, prev):
-    if prev is None:
-        return "(0.00)"
-    delta = current - prev
-    sign = "+" if delta > 0 else ""
-    return f"({sign}{delta:.2f})"
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://tg-proxy.m-taghvaei74.workers.dev/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
 def run_pipeline():
-    global previous_scores
-    logging.info("Starting run_pipeline...")
-    stocks_raw, depth_raw = fetch_market_data()
-    if not stocks_raw:
-        logging.warning("No data parsed from TSETMC.")
-        return
+    try:
+        s_raw, d_raw = fetch_market_data()
+        data = parse_market_data(s_raw, d_raw)
+        if not data:
+            return
+        stock_dict = {s["symbol"]: s for s in data}
 
-    data = parse_market_data(stocks_raw, depth_raw)
-    stock_dict = {s["symbol"]: s for s in data}
+        leveraged_list = [stock_dict[sym] for sym in LEVERAGED_FUNDS if sym in stock_dict]
+        leveraged_list.sort(key=lambda x: x["score"], reverse=True)
+        msg_lev = "<b>#اهرمی - رتبه‌بندی صندوق‌های اهرمی</b>\n\n"
+        for idx, s in enumerate(leveraged_list, 1):
+            msg_lev += f"{idx}. {s['symbol']} | <b>{s['score']:.1f}</b> {get_symbol_stats(s['symbol'], s['score'])}\n"
 
-    # ۱. صندوق‌های اهرمی
-    leveraged_list = [stock_dict[sym] for sym in LEVERAGED_FUNDS if sym in stock_dict]
-    leveraged_list.sort(key=lambda x: x["score"], reverse=True)
-    msg_lev = "<b>#اهرمی - رتبه‌بندی صندوق‌های اهرمی</b>\n\n"
-    for idx, s in enumerate(leveraged_list, 1):
-        delta_str = format_delta(s['score'], previous_scores.get(s['symbol']))
-        msg_lev += f"{idx}. {s['symbol']} | امتیاز: <b>{s['score']}</b> {delta_str}\n"
+        leaders_list = [stock_dict[sym] for sym in LEADERS if sym in stock_dict]
+        leaders_list.sort(key=lambda x: x["score"], reverse=True)
+        msg_ldr = "<b>#لیدر - رتبه‌بندی سهام لیدر</b>\n\n"
+        msg_ldr += get_leaders_overall_stats(leaders_list)
+        for idx, s in enumerate(leaders_list[:10], 1):
+            msg_ldr += f"{idx}. {s['symbol']} | <b>{s['score']:.1f}</b> {get_symbol_stats(s['symbol'], s['score'])}\n"
 
-    # ۲. لیدرها
-    leaders_list = [stock_dict[sym] for sym in LEADERS if sym in stock_dict]
-    leaders_list.sort(key=lambda x: x["score"], reverse=True)
-    msg_ldr = "<b>#لیدر - رتبه‌بندی سهام لیدر</b>\n\n"
-    for idx, s in enumerate(leaders_list, 1):
-        delta_str = format_delta(s['score'], previous_scores.get(s['symbol']))
-        msg_ldr += f"{idx}. {s['symbol']} | امتیاز: <b>{s['score']}</b> {delta_str}\n"
-
-    # ۳. وضعیت صنایع
-    sectors = {}
-    for s in data:
-        sec = s["sector"]
-        if sec not in sectors:
-            sectors[sec] = []
-        sectors[sec].append(s["score"])
-
-    sector_stats = []
-    for sec, scores in sectors.items():
-        if len(scores) >= 3:
-            avg_score = sum(scores) / len(scores)
-            sector_stats.append({
-                "sector": sec,
-                "avg_score": round(avg_score, 2),
-                "count": len(scores)
-            })
-
-    sector_stats.sort(key=lambda x: x["avg_score"], reverse=True)
-    sector_rank_map = {item["sector"]: rank for rank, item in enumerate(sector_stats, 1)}
-
-    msg_sec = "<b>#وضعیت_صنایع - ۵ صنعت برتر بازار</b>\n\n"
-    for idx, sec in enumerate(sector_stats[:5], 1):
-        msg_sec += f"{idx}. صنعت {sec['sector']}: میانگین نمره = <b>{sec['avg_score']}</b> (تعداد سهام: {sec['count']})\n"
-
-    # ۴. سهام بازار بالای ۱۵ میلیارد
-    non_leaders = [
-        s for s in data 
-        if s["symbol"] not in LEADERS 
-        and s["symbol"] not in LEVERAGED_FUNDS
-        and s["trade_val"] >= 150_000_000_000
-    ]
-    non_leaders.sort(key=lambda x: x["score"], reverse=True)
-
-    msg_super = "<b>#سوپر - ۳۰ سهم برتر بازار</b>\n\n"
-    for idx, s in enumerate(non_leaders[:30], 1):
-        sec_rank = sector_rank_map.get(s['sector'], "-")
-        delta_str = format_delta(s['score'], previous_scores.get(s['symbol']))
-        msg_super += f"{idx}. {s['symbol']} | امتیاز: <b>{s['score']}</b> {delta_str} (رتبه صنعت: {sec_rank})\n"
-
-    msg_semi = "<b>#نیمه_سوپر - ۳۰ سهم دوم بازار</b>\n\n"
-    for idx, s in enumerate(non_leaders[30:60], 31):
-        sec_rank = sector_rank_map.get(s['sector'], "-")
-        delta_str = format_delta(s['score'], previous_scores.get(s['symbol']))
-        msg_semi += f"{idx}. {s['symbol']} | امتیاز: <b>{s['score']}</b> {delta_str} (رتبه صنعت: {sec_rank})\n"
-
-    for msg in [msg_lev, msg_ldr, msg_sec, msg_super, msg_semi]:
-        send_telegram_message(msg)
-        time.sleep(1.5)
-
-    for s in data:
-        previous_scores[s["symbol"]] = s["score"]
+        save_scores(data)
+        send_telegram(msg_lev)
+        send_telegram(msg_ldr)
+        logging.info("Reports sent successfully.")
+    except Exception as e:
+        logging.error(f"Pipeline error: {e}")
 
 def is_market_open():
-    tehran_tz = pytz.timezone("Asia/Tehran")
-    now = datetime.datetime.now(tehran_tz)
+    now = datetime.now()
     if now.weekday() in [3, 4]:
         return False
-    market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    market_end = now.replace(hour=12, minute=30, second=0, microsecond=0)
-    return market_start <= now <= market_end
+    start = now.replace(hour=8, minute=45, second=0, microsecond=0)
+    end = now.replace(hour=12, minute=35, second=0, microsecond=0)
+    return start <= now <= end
 
 def main():
-    logging.info("Starting Web Server Thread...")
-    threading.Thread(target=run_web, daemon=True).start()
-
-    logging.info("Bourse Alert Bot started successfully.")
-
-    # تست اولیه بلافاصله پس از اجرا
-    logging.info("Triggering initial test run...")
-    try:
-        run_pipeline()
-    except Exception as e:
-        logging.error(f"Error in initial test: {e}")
-
+    init_db()
+    logging.info("Bourse Bot started.")
     while True:
         try:
             if is_market_open():
-                logging.info("Market is OPEN. Running analysis...")
                 run_pipeline()
-                time.sleep(600)
+                time.sleep(300)
             else:
-                logging.info("Market is CLOSED. Sleeping for 60 seconds...")
+                logging.info("Market CLOSED. Sleeping 60s...")
                 time.sleep(60)
         except Exception as e:
-            logging.error(f"Unexpected error in main loop: {e}")
-            time.sleep(30)
+            logging.error(f"Loop error: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
