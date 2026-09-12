@@ -31,13 +31,17 @@ def queue_value_billion_toman(price, volume):
     return int(float(price) * float(volume) / 10 / 1_000_000_000)
 
 
+def ltr_signed(value, decimals=1):
+    return f"\u200e{value:+.{decimals}f}\u200e"
+
+
 def format_report_line(index, stock):
-    score = f"{stock['score']:+.1f}"
+    score = ltr_signed(stock["score"])
     value = int(stock.get("queue_value", 0))
     if value and stock.get("queue_side") == "buy":
-        return f"{index}. {stock['symbol']} | {score} | +{value} میلیارد"
+        return f"{index}. {stock['symbol']} | {score} | \u200e+{value} B\u200e"
     if value and stock.get("queue_side") == "sell":
-        return f"{index}. {stock['symbol']} | {score} | -{value} میلیارد"
+        return f"{index}. {stock['symbol']} | {score} | \u200e-{value} B\u200e"
     return f"{index}. {stock['symbol']} | {score}"
 
 
