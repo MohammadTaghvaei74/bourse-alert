@@ -60,6 +60,14 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS history (symbol TEXT NOT NULL, score REAL NOT NULL, timestamp TEXT NOT NULL)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_symbol_time ON history(symbol, timestamp)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS market_snapshots (
+            timestamp TEXT PRIMARY KEY,
+            count INTEGER NOT NULL,
+            average REAL NOT NULL,
+            median REAL NOT NULL,
+            buy_value_hmt REAL NOT NULL,
+            sell_value_hmt REAL NOT NULL
+        )""")
 
 
 def save_scores(stocks, now):
@@ -166,6 +174,10 @@ def parse_market_data(stocks_raw, depth_raw):
             symbol = fields[2].replace("ي", "ی").replace("ك", "ک").strip()
             yesterday = _float(fields[13]); close = _float(fields[6]); last = _float(fields[7])
             trade_volume = _float(fields[9]); max_price = _float(fields[19]); min_price = _float(fields[20])
+            instrument_type = fields[25].strip() if len(fields) > 25 else ""
+            description = fields[3].replace("ي", "ی").replace("ك", "ک").strip() if len(fields) > 3 else ""
+            eligible_market_stock = (instrument_type in {"N1", "N2"} and not any(c.isdigit() for c in symbol)
+                                     and not symbol.endswith("ح") and not description.startswith("صندوق"))
             if not symbol or yesterday <= 0 or is_derivative(symbol):
                 continue
             last_pct = round((last - yesterday) / yesterday * 100, 2)
@@ -177,25 +189,53 @@ def parse_market_data(stocks_raw, depth_raw):
             best_sell_price = min(sell_prices, default=0)
             buy_queue = buy_volume > 0 and best_buy_price >= max_price - 1
             sell_queue = sell_volume > 0 and best_sell_price <= min_price + 1
+            buy_value_toman = best_buy_price * buy_volume / 10 if buy_queue else 0.0
+            sell_value_toman = best_sell_price * sell_volume / 10 if sell_queue else 0.0
             if buy_queue and not sell_queue:
                 side, volume, price = "buy", buy_volume, best_buy_price
             elif sell_queue and not buy_queue:
                 side, volume, price = "sell", sell_volume, best_sell_price
             else:
                 side, volume, price = None, 0, 0
-            result.append({"symbol": symbol, "score": calculate_score(last_pct, volume if side == "buy" else 0, volume if side == "sell" else 0, trade_volume), "trade_volume": trade_volume, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
+            result.append({"symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
         except (ValueError, IndexError, ZeroDivisionError):
             continue
     return result
 
 
-def market_summary(stocks):
-    scores = [float(s["score"]) for s in stocks if float(s.get("trade_volume", 0)) > 0]
+def market_summary_values(stocks):
+    eligible = [s for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
+    scores = [float(s["score"]) for s in eligible]
     average = statistics.mean(scores) if scores else 0.0
     median = statistics.median(scores) if scores else 0.0
-    return (f"تعداد کل سهام معامله شده امروز: {len(scores)}\n"
-            f"میانگین نمره: {average:.1f}\n"
-            f"میانه نمره: {median:.1f}")
+    buy_value_hmt = sum(float(s.get("buy_queue_value_toman", 0)) for s in eligible) / 1_000_000_000_000
+    sell_value_hmt = sum(float(s.get("sell_queue_value_toman", 0)) for s in eligible) / 1_000_000_000_000
+    return len(scores), average, median, buy_value_hmt, sell_value_hmt
+
+
+def market_summary(stocks, previous=None):
+    count, average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
+    lines = [f"تعداد کل سهام معامله شده امروز: {count}",
+             f"میانگین نمره: {average:.1f}",
+             f"میانه نمره: {median:.1f}",
+             f"ارزش سفارشات خرید در سقف: {buy_hmt:.2f} همت",
+             f"ارزش سفارشات فروش در کف: {sell_hmt:.2f} همت"]
+    if previous:
+        lines.extend([f"قبل: تعداد {count - previous[0]:+.0f} | میانگین {average - previous[1]:+.1f} | میانه {median - previous[2]:+.1f} | خرید {buy_hmt - previous[3]:+.2f} | فروش {sell_hmt - previous[4]:+.2f}"])
+    return "\n".join(lines)
+
+
+def save_market_snapshot(values, now):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?)", (now.isoformat(), *values))
+        conn.execute("DELETE FROM market_snapshots WHERE timestamp < ?", ((now - timedelta(days=7)).isoformat(),))
+
+
+def previous_market_snapshot(now):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT count, average, median, buy_value_hmt, sell_value_hmt FROM market_snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1", (now.isoformat(),)).fetchone()
+    return tuple(row) if row else None
+
 
 
 def build_group_message(title, stocks, now, limit=None):
@@ -351,6 +391,10 @@ def run_pipeline(session=None, now=None):
         return 0
     init_db()
     save_scores(data, now)
+    market_values = market_summary_values(data)
+    market_previous = previous_market_snapshot(now)
+    send_telegram(market_summary(data, market_previous), session)
+    save_market_snapshot(market_values, now)
     send_telegram(build_group_message("#اهرمی", leveraged, now), session)
     send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
     chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
@@ -387,7 +431,14 @@ def main():
 def send_current_market_summary():
     stocks_raw, depth_raw = fetch_market_data()
     data = parse_market_data(stocks_raw, depth_raw)
-    return send_telegram(market_summary(data))
+    values = market_summary_values(data)
+    now = datetime.now(TEHRAN)
+    previous = previous_market_snapshot(now)
+    message = market_summary(data, previous)
+    result = send_telegram(message)
+    init_db()
+    save_market_snapshot(values, now)
+    return result
 
 
 if __name__ == "__main__":
