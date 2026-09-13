@@ -236,7 +236,7 @@ def main():
         try:
             if is_market_open():
                 run_pipeline()
-                time.sleep(120)
+                time.sleep(300)
             else:
                 time.sleep(60)
         except Exception:
