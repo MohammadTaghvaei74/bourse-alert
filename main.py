@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 DB_PATH = os.getenv("DB_PATH", "/root/bourse-alert/scores_history.db")
 TSETMC_URL = "https://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx"
@@ -207,6 +210,61 @@ def send_telegram(text, session=None):
     return data
 
 
+def _chart_points(symbols, now):
+    if not symbols:
+        return []
+    marks = ",".join("?" for _ in symbols)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    query = f"SELECT symbol, score, timestamp FROM history WHERE symbol IN ({marks}) AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, symbol"
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(query, list(symbols) + [day_start.isoformat(), now.isoformat()]).fetchall()
+    points = {}
+    for symbol, score, timestamp in rows:
+        points.setdefault(timestamp, {})[symbol] = score
+    return [(timestamp, values) for timestamp, values in sorted(points.items())]
+
+
+def create_score_chart(title, stocks, now, filename):
+    symbols = [s["symbol"] for s in stocks]
+    points = _chart_points(symbols, now)
+    if not points:
+        return None
+    times = [datetime.fromisoformat(t).astimezone(TEHRAN).strftime("%H:%M") for t, _ in points]
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
+    for symbol in symbols:
+        values = [row.get(symbol) for _, row in points]
+        if any(value is not None for value in values):
+            ax.plot(times, values, marker="o", linewidth=1.8, markersize=3, label=symbol)
+    averages = []
+    for _, row in points:
+        values = [row[s] for s in symbols if s in row]
+        averages.append(sum(values) / len(values) if values else None)
+    ax.plot(times, averages, color="black", linewidth=4, label="میانگین")
+    ax.set_title(title, fontsize=16, fontweight="bold")
+    ax.set_xlabel("زمان")
+    ax.set_ylabel("نمره")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(filename, format="png")
+    plt.close(fig)
+    return filename
+
+
+def send_telegram_photo(filename, caption, session=None):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    url = f"{TELEGRAM_PROXY.rstrip('/')}/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    with open(filename, "rb") as image:
+        response = (session or requests).post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"photo": image}, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data
+
+
 def run_pipeline(session=None, now=None):
     now = now or datetime.now(TEHRAN)
     stocks_raw, depth_raw = fetch_market_data(session)
@@ -221,6 +279,14 @@ def run_pipeline(session=None, now=None):
     save_scores(data, now)
     send_telegram(build_group_message("#اهرمی", leveraged, now), session)
     send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
+    chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
+    os.makedirs(chart_dir, exist_ok=True)
+    leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
+    leaders_chart = create_score_chart("#لیدر - روند نمره ۶ لیدر برتر", leaders[:6], now, os.path.join(chart_dir, "leaders.png"))
+    if leveraged_chart:
+        send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
+    if leaders_chart:
+        send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۶ لیدر برتر", session)
     return len(data)
 
 
