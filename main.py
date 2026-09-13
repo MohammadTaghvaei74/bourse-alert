@@ -32,14 +32,16 @@ def queue_value_billion_toman(price, volume):
 
 
 def ltr_signed(value, decimals=1):
-    return f"\u200e{value:+.{decimals}f}\u200e"
+    value = float(value)
+    sign = "-" if value < 0 else ""
+    return f"\u200e{sign}{abs(value):.{decimals}f}\u200e"
 
 
 def format_report_line(index, stock):
     score = ltr_signed(stock["score"])
     value = int(stock.get("queue_value", 0))
     if value and stock.get("queue_side") == "buy":
-        return f"{index}. {stock['symbol']} | {score} | \u200e+{value} B\u200e"
+        return f"{index}. {stock['symbol']} | {score} | \u200e{value} B\u200e"
     if value and stock.get("queue_side") == "sell":
         return f"{index}. {stock['symbol']} | {score} | \u200e-{value} B\u200e"
     return f"{index}. {stock['symbol']} | {score}"
@@ -58,18 +60,29 @@ def save_scores(stocks, now):
         conn.execute("DELETE FROM history WHERE timestamp < ?", ((now - timedelta(days=7)).isoformat(),))
 
 
-def _avg_for(symbols, start=None, end=None):
+def _snapshot_avg(symbols, start=None, end=None):
+    """Average the latest score for each symbol in a time window."""
     if not symbols:
         return None
     marks = ",".join("?" for _ in symbols)
     clauses = [f"symbol IN ({marks})"]
     params = list(symbols)
     if start:
-        clauses.append("timestamp >= ?"); params.append(start.isoformat())
+        clauses.append("timestamp >= ?")
+        params.append(start.isoformat())
     if end:
-        clauses.append("timestamp < ?"); params.append(end.isoformat())
+        clauses.append("timestamp < ?")
+        params.append(end.isoformat())
+    query = f"""
+        SELECT AVG(score) FROM (
+            SELECT score,
+                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
+            FROM history
+            WHERE {' AND '.join(clauses)}
+        ) WHERE rn = 1
+    """
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(f"SELECT AVG(score) FROM history WHERE {' AND '.join(clauses)}", params).fetchone()
+        row = conn.execute(query, params).fetchone()
     return row[0] if row and row[0] is not None else None
 
 
@@ -77,14 +90,15 @@ def group_stats(stocks, now):
     init_db()
     symbols = [s["symbol"] for s in stocks]
     current = sum(s["score"] for s in stocks) / len(stocks) if stocks else 0.0
-    previous = _avg_for(symbols, end=now)
-    yesterday = _avg_for(symbols, start=now - timedelta(days=2), end=now - timedelta(days=1))
-    five_day = _avg_for(symbols, start=now - timedelta(days=6), end=now - timedelta(days=1))
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    previous = _snapshot_avg(symbols, end=now)
+    yesterday = _snapshot_avg(symbols, start=today_start - timedelta(days=1), end=today_start)
+    five_day = _snapshot_avg(symbols, start=today_start - timedelta(days=5), end=today_start)
     return current, tuple(current - x if x is not None else 0.0 for x in (previous, yesterday, five_day))
 
 
 def fmt_delta(value):
-    return f"{value:+.1f}"
+    return ltr_signed(value)
 
 
 def _float(value):
@@ -153,7 +167,7 @@ def parse_market_data(stocks_raw, depth_raw):
 def build_group_message(title, stocks, now, limit=None):
     shown = stocks[:limit] if limit else stocks
     average, deltas = group_stats(shown, now)
-    lines = [f"<b>{html.escape(title)}</b>", f"میانگین {average:+.1f} | قبل {fmt_delta(deltas[0])} | دیروز {fmt_delta(deltas[1])} | ۵روزه {fmt_delta(deltas[2])}", ""]
+    lines = [f"<b>{html.escape(title)}</b>", f"میانگین {ltr_signed(average)} | قبل {fmt_delta(deltas[0])} | دیروز {fmt_delta(deltas[1])} | ۵روزه {fmt_delta(deltas[2])}", ""]
     lines.extend(format_report_line(i, stock) for i, stock in enumerate(shown, 1))
     return "\n".join(lines)
 
