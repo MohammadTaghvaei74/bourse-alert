@@ -2,6 +2,7 @@ import html
 import logging
 import os
 import sqlite3
+import statistics
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -182,10 +183,19 @@ def parse_market_data(stocks_raw, depth_raw):
                 side, volume, price = "sell", sell_volume, best_sell_price
             else:
                 side, volume, price = None, 0, 0
-            result.append({"symbol": symbol, "score": calculate_score(last_pct, volume if side == "buy" else 0, volume if side == "sell" else 0, trade_volume), "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
+            result.append({"symbol": symbol, "score": calculate_score(last_pct, volume if side == "buy" else 0, volume if side == "sell" else 0, trade_volume), "trade_volume": trade_volume, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
         except (ValueError, IndexError, ZeroDivisionError):
             continue
     return result
+
+
+def market_summary(stocks):
+    scores = [float(s["score"]) for s in stocks if float(s.get("trade_volume", 0)) > 0]
+    average = statistics.mean(scores) if scores else 0.0
+    median = statistics.median(scores) if scores else 0.0
+    return (f"تعداد کل سهام معامله شده امروز: {len(scores)}\n"
+            f"میانگین نمره: {average:.1f}\n"
+            f"میانه نمره: {median:.1f}")
 
 
 def build_group_message(title, stocks, now, limit=None):
@@ -374,5 +384,14 @@ def main():
             time.sleep(30)
 
 
+def send_current_market_summary():
+    stocks_raw, depth_raw = fetch_market_data()
+    data = parse_market_data(stocks_raw, depth_raw)
+    return send_telegram(market_summary(data))
+
+
 if __name__ == "__main__":
-    main()
+    if "--market-summary" in os.sys.argv:
+        send_current_market_summary()
+    else:
+        main()

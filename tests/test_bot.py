@@ -1,4 +1,18 @@
-from main import calculate_score, queue_value_billion_toman, format_report_line
+from main import calculate_score, queue_value_billion_toman, format_report_line, market_summary
+
+
+def test_market_summary_reports_count_average_and_median_for_traded_stocks():
+    stocks = [
+        {"symbol": "الف", "score": 1.0, "trade_volume": 100},
+        {"symbol": "ب", "score": 2.0, "trade_volume": 200},
+        {"symbol": "ج", "score": 5.0, "trade_volume": 300},
+        {"symbol": "د", "score": 9.0, "trade_volume": 0},
+    ]
+    assert market_summary(stocks) == "تعداد کل سهام معامله شده امروز: 3\\nمیانگین نمره: 2.7\\nمیانه نمره: 2.0"
+
+
+def test_market_summary_is_empty_when_no_stock_traded():
+    assert market_summary([{ "symbol": "الف", "score": 1.0, "trade_volume": 0 }]) == "تعداد کل سهام معامله شده امروز: 0\\nمیانگین نمره: 0.0\\nمیانه نمره: 0.0"
 
 
 def test_buy_queue_score_uses_last_percent_plus_queue_ratio():
