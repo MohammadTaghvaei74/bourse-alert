@@ -274,13 +274,34 @@ def create_score_chart(title, stocks, now, filename):
     try:
         from PIL import Image, ImageDraw, ImageFont
         scale = 2
-        img = Image.new("RGB", (width*scale, height*scale), "white")
+        img = Image.new("RGB", (width * scale, height * scale), "white")
         draw = ImageDraw.Draw(img)
-        draw.rectangle((0,0,width*scale-1,height*scale-1), outline="#cccccc", width=2)
-        # Keep SVG as the source artifact; Pillow creates a crisp fallback raster with a clear legend.
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24*scale)
-        draw.text((20*scale,20*scale), title, fill="black", font=font)
+        def font(size):
+            try:
+                return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size * scale)
+            except OSError:
+                return ImageFont.load_default()
+        draw.rectangle((0, 0, width * scale - 1, height * scale - 1), outline="#bbbbbb", width=3)
+        draw.text((width * scale // 2, 28 * scale), title, fill="black", font=font(30), anchor="ma")
+        for i in range(6):
+            y = int((top + plot_h * i / 5) * scale)
+            draw.line((left * scale, y, (left + plot_w) * scale, y), fill="#dddddd", width=2)
+            val = hi - (hi - lo) * i / 5
+            draw.text(((left - 15) * scale, y), f"{val:.1f}", fill="#333333", font=font(20), anchor="rm")
+        for idx, symbol in enumerate(symbols):
+            coords = [(int(x * scale), int(y * scale)) for x, y in [(x_at(i), y_at(row[symbol])) for i, (_, row) in enumerate(points) if symbol in row]]
+            if len(coords) > 1:
+                draw.line(coords, fill=colors[idx % len(colors)], width=5 * scale, joint="curve")
+            ly = int((top + idx * 42) * scale)
+            draw.line(((width - right + 20) * scale, ly, (width - right + 65) * scale, ly), fill=colors[idx % len(colors)], width=6 * scale)
+            draw.text(((width - right + 80) * scale, ly), symbol, fill="black", font=font(22), anchor="lm")
+        if len(avg) > 1:
+            draw.line([(int(x * scale), int(y * scale)) for x, y in avg], fill="black", width=8 * scale, joint="curve")
+        ly = int((top + len(symbols) * 42) * scale)
+        draw.line(((width - right + 20) * scale, ly, (width - right + 65) * scale, ly), fill="black", width=8 * scale)
+        draw.text(((width - right + 80) * scale, ly), "میانگین", fill="black", font=font(22), anchor="lm")
         img.save(filename, "PNG", optimize=True)
+
     finally:
         try: os.remove(svg_path)
         except OSError: pass
@@ -317,7 +338,7 @@ def run_pipeline(session=None, now=None):
     chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
     os.makedirs(chart_dir, exist_ok=True)
     leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
-    leaders_chart = create_score_chart("#لیدر - روند نمره ۶ لیدر برتر", leaders[:6], now, os.path.join(chart_dir, "leaders.png"))
+    leaders_chart = create_score_chart("#لیدر - روند نمره ۱۰ لیدر برتر", leaders[:10], now, os.path.join(chart_dir, "leaders.png"))
     if leveraged_chart:
         send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
     if leaders_chart:
@@ -337,7 +358,7 @@ def main():
         try:
             if is_market_open():
                 run_pipeline()
-                time.sleep(300)
+                time.sleep(120)
             else:
                 time.sleep(60)
         except Exception:
