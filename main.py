@@ -406,7 +406,7 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines = [
         "📊 <b>#وضعیت_بازار</b>",
         "",
-        f"⭐ نمره میانه: {status_stars(median_status)}",
+        f"📈 نمره میانه: {status_stars(median_status)}",
         f"⚖️ سربار تقاضا خالص: {status_stars(imbalance_status)}",
         f"💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
         "",
@@ -452,7 +452,7 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
         lines.extend([
             "",
             "💧 <b>ارزش معاملات</b>",
-            f"امروز: {turnover_hmt:.2f} همت | نسبت ۳/۱۰روزه: {ratio_text}",
+            f"امروز: {turnover_hmt:.0f} همت | نسبت ۳/۱۰روزه: {ratio_text}",
         ])
     return "\n".join(lines)
 
