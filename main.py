@@ -66,8 +66,17 @@ def init_db():
             average REAL NOT NULL,
             median REAL NOT NULL,
             buy_value_hmt REAL NOT NULL,
-            sell_value_hmt REAL NOT NULL
+            sell_value_hmt REAL NOT NULL,
+            leader_average REAL NOT NULL DEFAULT 0,
+            leader_median REAL NOT NULL DEFAULT 0
         )""")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(market_snapshots)")}
+        if "leader_average" not in columns:
+            conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_average REAL NOT NULL DEFAULT 0")
+        if "leader_median" not in columns:
+            conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_median REAL NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(timestamp)")
+        conn.commit()
 
 
 def save_scores(stocks, now):
@@ -225,16 +234,21 @@ def market_summary(stocks, previous=None):
     return "\n".join(lines)
 
 
-def save_market_snapshot(values, now):
+def save_market_snapshot(values, now, leader_average=0.0, leader_median=0.0):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?)", (now.isoformat(), *values))
+        conn.execute("INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (now.isoformat(), *values, leader_average, leader_median))
         conn.execute("DELETE FROM market_snapshots WHERE timestamp < ?", ((now - timedelta(days=7)).isoformat(),))
 
 
 def previous_market_snapshot(now):
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT count, average, median, buy_value_hmt, sell_value_hmt FROM market_snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1", (now.isoformat(),)).fetchone()
+        row = conn.execute("SELECT count, average, median, buy_value_hmt, sell_value_hmt, leader_average, leader_median FROM market_snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1", (now.isoformat(),)).fetchone()
     return tuple(row) if row else None
+
+
+def market_group_average_median(stocks):
+    scores = [float(s["score"]) for s in stocks]
+    return (statistics.mean(scores), statistics.median(scores)) if scores else (0.0, 0.0)
 
 
 
@@ -265,7 +279,7 @@ def _chart_points(symbols, now):
     if not symbols:
         return []
     marks = ",".join("?" for _ in symbols)
-    chart_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    chart_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     query = f"SELECT symbol, score, timestamp FROM history WHERE symbol IN ({marks}) AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, symbol"
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(query, list(symbols) + [chart_start.isoformat(), now.isoformat()]).fetchall()
@@ -366,6 +380,56 @@ def create_score_chart(title, stocks, now, filename):
     return filename
 
 
+def _snapshot_points(now):
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT timestamp, average, median, leader_average, leader_median, buy_value_hmt, sell_value_hmt FROM market_snapshots WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp", (start, now.isoformat())).fetchall()
+    return rows
+
+
+def create_market_charts(now, chart_dir):
+    from PIL import Image, ImageDraw, ImageFont
+    rows = _snapshot_points(now)
+    if len(rows) < 2:
+        return []
+    os.makedirs(chart_dir, exist_ok=True)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    def font(size):
+        try: return ImageFont.truetype(font_path, size)
+        except OSError: return ImageFont.load_default()
+    colors = ["#1565c0", "#d84315", "#2e7d32", "#8e24aa"]
+    labels = ["میانه کل بازار", "میانگین کل بازار", "میانه لیدر", "میانگین لیدر"]
+    times = [r[0] for r in rows]
+    def render(title, series, legend, path, ylabel):
+        width, height = 2200, 1250; left, right, top, bottom = 150, 430, 120, 180
+        pw, ph = width-left-right, height-top-bottom
+        vals = [v for line in series for v in line]; low, high = min(vals), max(vals)
+        pad = max((high-low)*.12, 1); low -= pad; high += pad
+        img = Image.new("RGB", (width,height), "white"); draw=ImageDraw.Draw(img)
+        def x(i): return left + i*pw/max(len(rows)-1,1)
+        def y(v): return top + (high-v)*ph/max(high-low,1e-9)
+        draw.rectangle((0,0,width-1,height-1), outline="#bdbdbd", width=3)
+        draw.text((width//2,35), title, fill="#111", font=font(38), anchor="ma")
+        for k in range(7):
+            val=high-(high-low)*k/6; yy=int(top+ph*k/6)
+            draw.line((left,yy,left+pw,yy), fill="#e0e0e0", width=2); draw.text((left-18,yy),f"{val:.1f}",fill="#333",font=font(23),anchor="rm")
+        for j,line in enumerate(series):
+            draw.line([(int(x(i)),int(y(v))) for i,v in enumerate(line)], fill=colors[j], width=7, joint="curve")
+        step=max(1,(len(rows)-1)//7)
+        for i in range(0,len(rows),step):
+            draw.text((int(x(i)),height-bottom+25),times[i][11:16],fill="#333",font=font(24),anchor="ma")
+        draw.text((left+pw//2,height-35),"زمان",fill="#222",font=font(28),anchor="ma"); draw.text((35,(top+height-bottom)//2),ylabel,fill="#222",font=font(28),anchor="mm")
+        for j,name in enumerate(legend):
+            yy=top+15+j*58; draw.line((width-right+20,yy,width-right+85,yy),fill=colors[j],width=8); draw.text((width-right+105,yy),name,fill="#111",font=font(27),anchor="lm")
+        img.save(path,"PNG",optimize=True); return path
+    score_path=render("#وضعیت بازار - روند نمره", [[r[2], r[2]] for r in rows], labels, os.path.join(chart_dir,"market_scores.png"), "نمره")
+    # Build each series across snapshots, keeping the four requested lines.
+    score_path=render("#وضعیت بازار - روند نمره", [[r[2] for r in rows],[r[1] for r in rows],[r[4] for r in rows],[r[3] for r in rows]], labels, os.path.join(chart_dir,"market_scores.png"), "نمره")
+    imbalance=[r[5]-r[6] for r in rows]
+    imbalance_path=render("#وضعیت بازار - اختلاف صف خرید و فروش", [imbalance], ["خرید - فروش"], os.path.join(chart_dir,"market_imbalance.png"), "همت")
+    return [score_path, imbalance_path]
+
+
 def send_telegram_photo(filename, caption, session=None):
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
@@ -381,6 +445,7 @@ def send_telegram_photo(filename, caption, session=None):
 
 def run_pipeline(session=None, now=None):
     now = now or datetime.now(TEHRAN)
+    send_reports = now >= now.replace(hour=9, minute=30, second=0, microsecond=0)
     stocks_raw, depth_raw = fetch_market_data(session)
     data = parse_market_data(stocks_raw, depth_raw)
     stock_dict = {s["symbol"]: s for s in data}
@@ -393,24 +458,30 @@ def run_pipeline(session=None, now=None):
     save_scores(data, now)
     market_values = market_summary_values(data)
     market_previous = previous_market_snapshot(now)
-    send_telegram(market_summary(data, market_previous), session)
-    save_market_snapshot(market_values, now)
-    send_telegram(build_group_message("#اهرمی", leveraged, now), session)
-    send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
-    chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
-    os.makedirs(chart_dir, exist_ok=True)
-    leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
-    leaders_chart = create_score_chart("#لیدر - روند نمره ۱۰ لیدر برتر", leaders[:10], now, os.path.join(chart_dir, "leaders.png"))
-    if leveraged_chart:
-        send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
-    if leaders_chart:
-        send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۶ لیدر برتر", session)
+    leader_average, leader_median = market_group_average_median(leaders)
+    save_market_snapshot(market_values, now, leader_average, leader_median)
+    if send_reports:
+        send_telegram(market_summary(data, market_previous), session)
+        send_telegram(build_group_message("#اهرمی", leveraged, now), session)
+        send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
+    if send_reports:
+        chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
+        os.makedirs(chart_dir, exist_ok=True)
+        leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
+        leaders_chart = create_score_chart("#لیدر - روند نمره ۱۰ لیدر برتر", leaders[:10], now, os.path.join(chart_dir, "leaders.png"))
+        if leveraged_chart:
+            send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
+        if leaders_chart:
+            send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۱۰ لیدر برتر", session)
+        market_charts = create_market_charts(now, chart_dir)
+        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۴ روند نمره", "#وضعیت بازار - اختلاف صف خرید و فروش")):
+            send_telegram_photo(chart, caption, session)
     return len(data)
 
 
 def is_market_open(now=None):
     now = now or datetime.now(TEHRAN)
-    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=30, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=35, second=0, microsecond=0)
+    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=0, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=35, second=0, microsecond=0)
 
 
 def main():
