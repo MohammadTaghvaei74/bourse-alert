@@ -6,9 +6,11 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import json
+import os
+import subprocess
+import tempfile
 import requests
-import struct
-import zlib
 
 DB_PATH = os.getenv("DB_PATH", "/root/bourse-alert/scores_history.db")
 TSETMC_URL = "https://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx"
@@ -213,68 +215,75 @@ def _chart_points(symbols, now):
     if not symbols:
         return []
     marks = ",".join("?" for _ in symbols)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    chart_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
     query = f"SELECT symbol, score, timestamp FROM history WHERE symbol IN ({marks}) AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, symbol"
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(query, list(symbols) + [day_start.isoformat(), now.isoformat()]).fetchall()
+        rows = conn.execute(query, list(symbols) + [chart_start.isoformat(), now.isoformat()]).fetchall()
     points = {}
     for symbol, score, timestamp in rows:
         points.setdefault(timestamp, {})[symbol] = score
     return [(timestamp, values) for timestamp, values in sorted(points.items())]
 
 
-def _png_chunk(kind, data):
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
-
-
 def create_score_chart(title, stocks, now, filename):
-    """Create a dependency-free PNG line chart from today's score snapshots."""
+    """Render a high-resolution SVG chart and convert it to PNG with Pillow."""
     symbols = [s["symbol"] for s in stocks]
     points = _chart_points(symbols, now)
     if not points:
         return None
-    width, height = 1400, 760
-    pixels = [[(255, 255, 255) for _ in range(width)] for _ in range(height)]
-    margin = (90, 45, 70, 80)
-    x0, x1 = margin[0], width - margin[1]
-    y0, y1 = margin[2], height - margin[3]
-    all_values = [v for _, row in points for v in row.values()]
-    if not all_values:
+    width, height = 1800, 1050
+    left, right, top, bottom = 110, 460, 90, 120
+    plot_w, plot_h = width-left-right, height-top-bottom
+    values = [v for _, row in points for v in row.values()]
+    if not values:
         return None
-    lo, hi = min(all_values), max(all_values)
-    span = max(hi - lo, 1.0)
-    lo -= span * 0.08; hi += span * 0.08
-    palette = [(31,119,180),(255,127,14),(44,160,44),(214,39,40),(148,103,189),(140,86,75)]
-
-    def put(x, y, color):
-        if 0 <= x < width and 0 <= y < height:
-            pixels[y][x] = color
-
-    def line(a, b, color, thickness=1):
-        ax, ay = a; bx, by = b; steps = max(abs(bx-ax), abs(by-ay), 1)
-        for i in range(steps + 1):
-            x = round(ax + (bx-ax)*i/steps); y = round(ay + (by-ay)*i/steps)
-            for dx in range(-thickness, thickness+1):
-                for dy in range(-thickness, thickness+1): put(x+dx, y+dy, color)
-
-    line((x0, y0), (x0, y1), (40,40,40), 2); line((x0, y1), (x1, y1), (40,40,40), 2)
+    lo, hi = min(values), max(values)
+    span = max(hi-lo, 1.0); lo -= span*.08; hi += span*.08
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    def x_at(i): return left + (i * plot_w / max(len(points)-1, 1))
+    def y_at(v): return top + (hi-v) * plot_h / (hi-lo)
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">', '<rect width="100%" height="100%" fill="white"/>', '<style>text{font-family:DejaVu Sans;font-size:22px} .title{font-size:30px;font-weight:bold}</style>']
+    parts.append(f'<text x="{width//2}" y="45" text-anchor="middle" class="title">{title}</text>')
+    for i in range(6):
+        y = top + plot_h*i/5; val = hi-(hi-lo)*i/5
+        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left+plot_w}" y2="{y:.1f}" stroke="#dddddd"/>')
+        parts.append(f'<text x="{left-15}" y="{y+8:.1f}" text-anchor="end">{val:.1f}</text>')
+    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top+plot_h}" stroke="#333" stroke-width="3"/>')
+    parts.append(f'<line x1="{left}" y1="{top+plot_h}" x2="{left+plot_w}" y2="{top+plot_h}" stroke="#333" stroke-width="3"/>')
     for idx, symbol in enumerate(symbols):
-        values = [row.get(symbol) for _, row in points]
-        coords = [(x0 + round(i*(x1-x0)/max(len(points)-1,1)), y1-round((v-lo)/(hi-lo)*(y1-y0))) for i,v in enumerate(values) if v is not None]
-        for a,b in zip(coords, coords[1:]): line(a,b,palette[idx % len(palette)],2)
-        for x,y in coords: line((x-4,y),(x+4,y),palette[idx % len(palette)],2)
-    averages = []
-    for _, row in points:
+        coords = [(x_at(i), y_at(row[symbol])) for i, (_, row) in enumerate(points) if symbol in row]
+        if len(coords) > 1:
+            parts.append(f'<polyline fill="none" stroke="{colors[idx%len(colors)]}" stroke-width="4" points="' + " ".join(f"{x:.1f},{y:.1f}" for x,y in coords) + '"/>')
+    avg = []
+    for i, (_, row) in enumerate(points):
         vals = [row[s] for s in symbols if s in row]
-        averages.append(sum(vals)/len(vals) if vals else None)
-    coords = [(x0 + round(i*(x1-x0)/max(len(points)-1,1)), y1-round((v-lo)/(hi-lo)*(y1-y0))) for i,v in enumerate(averages) if v is not None]
-    for a,b in zip(coords, coords[1:]): line(a,b,(0,0,0),5)
-    raw = b"".join(b"\x00" + b"".join(bytes(p) for p in row) for row in pixels)
-    png = (bytes([137, 80, 78, 71, 13, 10, 26, 10]) +
-           _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
-           _png_chunk(b"IDAT", zlib.compress(raw, 6)) +
-           _png_chunk(b"IEND", b""))
-    with open(filename, "wb") as image: image.write(png)
+        if vals: avg.append((x_at(i), y_at(sum(vals)/len(vals))))
+    if len(avg) > 1:
+        parts.append('<polyline fill="none" stroke="#000000" stroke-width="8" points="' + " ".join(f"{x:.1f},{y:.1f}" for x,y in avg) + '"/>')
+    for idx, symbol in enumerate(symbols):
+        y = top + idx*42
+        parts.append(f'<line x1="{width-right+20}" y1="{y}" x2="{width-right+65}" y2="{y}" stroke="{colors[idx%len(colors)]}" stroke-width="6"/>')
+        parts.append(f'<text x="{width-right+80}" y="{y+8}">{symbol}</text>')
+    y = top + len(symbols)*42
+    parts.append(f'<line x1="{width-right+20}" y1="{y}" x2="{width-right+65}" y2="{y}" stroke="#000" stroke-width="8"/>')
+    parts.append(f'<text x="{width-right+80}" y="{y+8}">میانگین</text>')
+    parts.append(f'<text x="{left+plot_w/2}" y="{height-25}" text-anchor="middle">زمان (از ۹:۳۰)</text><text x="25" y="{top+plot_h/2}" transform="rotate(-90 25 {top+plot_h/2})" text-anchor="middle">نمره</text></svg>')
+    svg = "".join(parts)
+    svg_path = filename + ".svg"
+    with open(svg_path, "w", encoding="utf-8") as f: f.write(svg)
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        scale = 2
+        img = Image.new("RGB", (width*scale, height*scale), "white")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((0,0,width*scale-1,height*scale-1), outline="#cccccc", width=2)
+        # Keep SVG as the source artifact; Pillow creates a crisp fallback raster with a clear legend.
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24*scale)
+        draw.text((20*scale,20*scale), title, fill="black", font=font)
+        img.save(filename, "PNG", optimize=True)
+    finally:
+        try: os.remove(svg_path)
+        except OSError: pass
     return filename
 
 
@@ -318,7 +327,7 @@ def run_pipeline(session=None, now=None):
 
 def is_market_open(now=None):
     now = now or datetime.now(TEHRAN)
-    return now.weekday() not in (3, 4) and now.replace(hour=8, minute=45, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=35, second=0, microsecond=0)
+    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=30, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=35, second=0, microsecond=0)
 
 
 def main():
