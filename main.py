@@ -39,12 +39,15 @@ def ltr_signed(value, decimals=1):
 
 def format_report_line(index, stock):
     score = ltr_signed(stock["score"])
+    previous_delta = ltr_signed(stock.get("previous_delta", 0.0))
     value = int(stock.get("queue_value", 0))
+    parts = [f"{index}. {stock['symbol']}", score]
     if value and stock.get("queue_side") == "buy":
-        return f"{index}. {stock['symbol']} | {score} | \u200e{value} B\u200e"
-    if value and stock.get("queue_side") == "sell":
-        return f"{index}. {stock['symbol']} | {score} | \u200e-{value} B\u200e"
-    return f"{index}. {stock['symbol']} | {score}"
+        parts.append(f"\u200e{value} B\u200e")
+    elif value and stock.get("queue_side") == "sell":
+        parts.append(f"\u200e-{value} B\u200e")
+    parts.append(f"قبل {previous_delta}")
+    return " | ".join(parts)
 
 
 def init_db():
@@ -84,6 +87,23 @@ def _snapshot_avg(symbols, start=None, end=None):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(query, params).fetchone()
     return row[0] if row and row[0] is not None else None
+
+
+def previous_scores(symbols, now):
+    if not symbols:
+        return {}
+    marks = ",".join("?" for _ in symbols)
+    query = f"""
+        SELECT symbol, score FROM (
+            SELECT symbol, score,
+                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
+            FROM history
+            WHERE symbol IN ({marks}) AND timestamp < ?
+        ) WHERE rn = 1
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(query, list(symbols) + [now.isoformat()]).fetchall()
+    return {symbol: score for symbol, score in rows}
 
 
 def group_stats(stocks, now):
@@ -167,7 +187,10 @@ def parse_market_data(stocks_raw, depth_raw):
 def build_group_message(title, stocks, now, limit=None):
     shown = stocks[:limit] if limit else stocks
     average, deltas = group_stats(shown, now)
-    lines = [f"<b>{html.escape(title)}</b>", f"میانگین {ltr_signed(average)} | قبل {fmt_delta(deltas[0])} | دیروز {fmt_delta(deltas[1])} | ۵روزه {fmt_delta(deltas[2])}", ""]
+    lines = [f"<b>{html.escape(title)}</b>", f"میانگین {ltr_signed(average)} | قبل {fmt_delta(deltas[0])}", ""]
+    old_scores = previous_scores([s["symbol"] for s in shown], now)
+    for stock in shown:
+        stock["previous_delta"] = stock["score"] - old_scores.get(stock["symbol"], stock["score"])
     lines.extend(format_report_line(i, stock) for i, stock in enumerate(shown, 1))
     return "\n".join(lines)
 
