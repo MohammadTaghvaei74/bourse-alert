@@ -199,7 +199,7 @@ def main():
         try:
             if is_market_open():
                 run_pipeline()
-                time.sleep(600)
+                time.sleep(120)
             else:
                 time.sleep(60)
         except Exception:
