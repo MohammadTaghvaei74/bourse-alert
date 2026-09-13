@@ -266,6 +266,17 @@ def classify_turnover_ratio(value):
     return "افتضاح"
 
 
+def status_stars(status):
+    """Convert the five-level status labels to a compact visual score."""
+    return {
+        "عالی": "⭐⭐⭐⭐⭐",
+        "خوب": "⭐⭐⭐⭐",
+        "معمولی": "⭐⭐⭐",
+        "بد": "⭐⭐",
+        "افتضاح": "⭐",
+    }.get(status, "—")
+
+
 def update_daily_turnover(stocks, now):
     turnover_hmt = sum(float(s.get("trade_value_toman", 0)) for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0) / 1_000_000_000_000
     date = now.date().isoformat()
@@ -335,14 +346,22 @@ def build_industry_message(stocks, now, limit=None):
 
 def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     count, average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
+    imbalance = buy_hmt - sell_hmt
+    median_status = classify_median(median)
+    imbalance_status = classify_imbalance(imbalance)
+    ratio_status = turnover[2] if turnover is not None else "داده کافی نیست"
     lines = [
         "📊 <b>#وضعیت_بازار</b>",
+        "",
+        f"⭐ میانه بازار: {status_stars(median_status)}",
+        f"⭐ اختلاف عرضه و تقاضا: {status_stars(imbalance_status)}",
+        f"⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
         "",
         "🏦 <b>کل بازار</b>",
         f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
         f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
         f"تعداد سهام معامله‌شده: {count}",
-        f"وضعیت میانه: {classify_median(median)}",
+        f"وضعیت میانه: {median_status}",
         "",
     ]
     if leader_stats is not None:
@@ -359,11 +378,10 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
         ])
     buy_delta = buy_hmt - previous[3] if previous else 0
     sell_delta = sell_hmt - previous[4] if previous else 0
-    imbalance = buy_hmt - sell_hmt
     lines.extend([
         f"🟢 خرید: {buy_hmt:.2f} همت | قبل: {buy_delta:.2f} همت",
         f"🔴 فروش: {sell_hmt:.2f} همت | قبل: {sell_delta:.2f} همت",
-        f"⚖️ اختلاف صف: {imbalance:.2f} همت | وضعیت: {classify_imbalance(imbalance)}",
+        f"⚖️ اختلاف صف: {imbalance:.2f} همت | وضعیت: {imbalance_status}",
     ])
     if turnover is not None:
         turnover_hmt, turnover_ratio, turnover_status = turnover

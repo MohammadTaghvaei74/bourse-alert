@@ -2,7 +2,29 @@ import os
 import sqlite3
 
 import main
-from main import calculate_score, queue_value_billion_toman, format_report_line, market_summary, market_allocation_signal
+from main import calculate_score, queue_value_billion_toman, format_report_line, market_summary, market_allocation_signal, status_stars
+
+
+
+def test_status_stars_map_five_levels_and_missing_data():
+    assert status_stars("عالی") == "⭐⭐⭐⭐⭐"
+    assert status_stars("خوب") == "⭐⭐⭐⭐"
+    assert status_stars("معمولی") == "⭐⭐⭐"
+    assert status_stars("بد") == "⭐⭐"
+    assert status_stars("افتضاح") == "⭐"
+    assert status_stars("داده کافی نیست") == "—"
+
+
+def test_market_summary_puts_three_status_scores_at_top():
+    stocks = [
+        {"symbol": "الف", "score": 3.0, "trade_volume": 100, "eligible_market_stock": True,
+         "buy_queue_value_toman": 6_000_000_000_000, "sell_queue_value_toman": 0},
+    ]
+    report = market_summary(stocks, leader_stats=(0.0, 0.0), turnover=(10.0, 1.3, "خوب"))
+    top = report.splitlines()[:5]
+    assert top[1] == "⭐ میانه بازار: ⭐⭐⭐⭐⭐"
+    assert top[2] == "⭐ اختلاف عرضه و تقاضا: ⭐⭐⭐⭐⭐"
+    assert top[3] == "⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
 
 
 def test_market_allocation_signal_classifies_median_gap():
@@ -12,6 +34,17 @@ def test_market_allocation_signal_classifies_median_gap():
     assert market_allocation_signal(0.0, 0.8) == "تمایل به سهام لیدرها"
     assert market_allocation_signal(-1.0, 0.2) == "تمایل به سهام لیدرها"
     assert market_allocation_signal(-1.1, 0.0) == "تمایل شدید به لیدرها"
+    assert market_allocation_signal(0.0, 1.1) == "تمایل شدید به لیدرها"
+
+
+def test_market_summary_reports_allocation_gap_and_signal():
+    stocks = [
+        {"symbol": "الف", "score": 1.0, "trade_volume": 100, "eligible_market_stock": True},
+        {"symbol": "ب", "score": 5.0, "trade_volume": 100, "eligible_market_stock": True},
+    ]
+    report = market_summary(stocks, leader_stats=(0.0, 1.0))
+    assert "اختلاف میانه کل بازار و لیدرها: ‎+2.0‎" in report
+    assert "تمایل پول: تمایل شدید به سهام هم‌وزن" in report
 
 
 def test_market_summary_reports_market_and_leader_medians_and_signal():
