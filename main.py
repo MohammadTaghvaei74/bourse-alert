@@ -329,33 +329,51 @@ def build_industry_message(stocks, now, limit=None):
     lines = ["#صنایع"]
     for index, item in enumerate(ranked, 1):
         delta = item["median"] - float(previous.get(item["industry"], 0.0))
-        lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل {ltr_signed(delta)}")
+        lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل ‎{delta:+.1f}‎")
     return "\n".join(lines)
 
 
 def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     count, average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
-    lines = [f"تعداد کل سهام معامله شده امروز: {count}",
-             f"میانگین نمره: {average:.1f}",
-             f"میانه نمره: {median:.1f} | وضعیت: {classify_median(median)}",
-             f"ارزش سفارشات خرید در سقف: {buy_hmt:.2f} همت",
-             f"ارزش سفارشات فروش در کف: {sell_hmt:.2f} همت",
-             f"اختلاف صف خرید و فروش: {buy_hmt - sell_hmt:.2f} همت | وضعیت: {classify_imbalance(buy_hmt - sell_hmt)}"]
-
+    lines = [
+        "📊 <b>#وضعیت_بازار</b>",
+        "",
+        "🏦 <b>کل بازار</b>",
+        f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
+        f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
+        f"تعداد سهام معامله‌شده: {count}",
+        f"وضعیت میانه: {classify_median(median)}",
+        "",
+    ]
     if leader_stats is not None:
         leader_average, leader_median = leader_stats
+        previous_leader_average = previous[5] if previous and len(previous) > 5 else None
+        previous_leader_median = previous[6] if previous and len(previous) > 6 else None
+        leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0
+        leader_average_delta = leader_average - previous_leader_average if previous_leader_average is not None else 0
         lines.extend([
-            f"میانه کل بازار: {median:.1f}",
-            f"میانه لیدرها: {float(leader_median):.1f}",
-            f"اختلاف میانه: ‎{median - float(leader_median):+.1f}‎",
-            market_allocation_signal(median, leader_median),
+            "👑 <b>لیدرها</b>",
+            f"میانه: {ltr_signed(leader_median)} | قبل: {ltr_signed(leader_median_delta)}",
+            f"میانگین: {ltr_signed(leader_average)} | قبل: {ltr_signed(leader_average_delta)}",
+            "",
         ])
+    buy_delta = buy_hmt - previous[3] if previous else 0
+    sell_delta = sell_hmt - previous[4] if previous else 0
+    imbalance = buy_hmt - sell_hmt
+    lines.extend([
+        f"🟢 خرید: {buy_hmt:.2f} همت | قبل: {buy_delta:.2f} همت",
+        f"🔴 فروش: {sell_hmt:.2f} همت | قبل: {sell_delta:.2f} همت",
+        f"⚖️ اختلاف صف: {imbalance:.2f} همت | وضعیت: {classify_imbalance(imbalance)}",
+    ])
     if turnover is not None:
         turnover_hmt, turnover_ratio, turnover_status = turnover
-        ratio_text = f"نسبت ۳/۱۰روزه: {turnover_ratio:.2f}" if turnover_ratio is not None else "نسبت ۳/۱۰روزه: داده کافی نیست"
-        lines.extend([f"روند ارزش معاملات: {turnover_status}", f"ارزش معاملات امروز: {turnover_hmt:.2f} همت | {ratio_text}"])
-    if previous:
-        lines.extend([f"قبل: تعداد {count - previous[0]:+.0f} | میانگین {average - previous[1]:+.1f} | میانه {median - previous[2]:+.1f} | خرید {buy_hmt - previous[3]:+.2f} | فروش {sell_hmt - previous[4]:+.2f}"])
+        ratio_text = f"{turnover_ratio:.2f}" if turnover_ratio is not None else "داده کافی نیست"
+        lines.extend([
+            "",
+            "💧 <b>ارزش معاملات</b>",
+            f"امروز: {turnover_hmt:.2f} همت | نسبت ۳/۱۰روزه: {ratio_text}",
+            f"وضعیت: {turnover_status}",
+        ])
     return "\n".join(lines)
 
 
