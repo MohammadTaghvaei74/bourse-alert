@@ -226,85 +226,93 @@ def _chart_points(symbols, now):
 
 
 def create_score_chart(title, stocks, now, filename):
-    """Render a high-resolution SVG chart and convert it to PNG with Pillow."""
+    """Create a sharp PNG with a broken Y-axis when an outlier compresses the data."""
+    from PIL import Image, ImageDraw, ImageFont
     symbols = [s["symbol"] for s in stocks]
     points = _chart_points(symbols, now)
     if not points:
         return None
-    width, height = 1800, 1050
-    left, right, top, bottom = 110, 460, 90, 120
-    plot_w, plot_h = width-left-right, height-top-bottom
+    width, height = 2400, 1500
+    left, right, top, bottom = 170, 520, 120, 190
+    plot_w = width - left - right
+    colors = ["#1565c0", "#e65100", "#2e7d32", "#c62828", "#6a1b9a", "#00838f", "#ad1457", "#546e7a", "#ef6c00", "#283593"]
     values = [v for _, row in points for v in row.values()]
     if not values:
         return None
-    lo, hi = min(values), max(values)
-    span = max(hi-lo, 1.0); lo -= span*.08; hi += span*.08
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
-    def x_at(i): return left + (i * plot_w / max(len(points)-1, 1))
-    def y_at(v): return top + (hi-v) * plot_h / (hi-lo)
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">', '<rect width="100%" height="100%" fill="white"/>', '<style>text{font-family:DejaVu Sans;font-size:22px} .title{font-size:30px;font-weight:bold}</style>']
-    parts.append(f'<text x="{width//2}" y="45" text-anchor="middle" class="title">{title}</text>')
-    for i in range(6):
-        y = top + plot_h*i/5; val = hi-(hi-lo)*i/5
-        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left+plot_w}" y2="{y:.1f}" stroke="#dddddd"/>')
-        parts.append(f'<text x="{left-15}" y="{y+8:.1f}" text-anchor="end">{val:.1f}</text>')
-    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top+plot_h}" stroke="#333" stroke-width="3"/>')
-    parts.append(f'<line x1="{left}" y1="{top+plot_h}" x2="{left+plot_w}" y2="{top+plot_h}" stroke="#333" stroke-width="3"/>')
+    values_sorted = sorted(values)
+    q1 = values_sorted[len(values_sorted) // 4]
+    q3 = values_sorted[(len(values_sorted) * 3) // 4]
+    iqr = max(q3 - q1, 1.0)
+    outlier = max(values) > q3 + 1.5 * iqr and max(values) - min(values) > 8
+    lo = min(values); hi = max(values)
+    if outlier:
+        lower_hi = min(hi - 1, q3 + 0.75 * iqr)
+        panels = [(top + 35, 610, lo, lower_hi), (700, 1050, lower_hi, hi)]
+    else:
+        panels = [(top + 35, height - bottom, lo, hi)]
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    def font(size):
+        try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+        except OSError: return ImageFont.load_default()
+    draw.rectangle((0, 0, width - 1, height - 1), outline="#bdbdbd", width=3)
+    draw.text((width // 2, 35), title, fill="#111111", font=font(38), anchor="ma")
+    def x_at(i): return left + i * plot_w / max(len(points) - 1, 1)
+    def y_at(value, panel):
+        y0, y1, low, high = panel
+        return y1 - (value - low) * (y1 - y0) / max(high - low, 1e-9)
+    for panel in panels:
+        y0, y1, low, high = panel
+        for tick in range(6):
+            value = high - (high - low) * tick / 5
+            y = int(y0 + (y1 - y0) * tick / 5)
+            draw.line((left, y, left + plot_w, y), fill="#e0e0e0", width=2)
+            draw.text((left - 18, y), f"{value:.1f}", fill="#333333", font=font(24), anchor="rm")
+        draw.line((left, y0, left, y1), fill="#333333", width=4)
+        draw.line((left, y1, left + plot_w, y1), fill="#333333", width=4)
+    if outlier:
+        mid = 655
+        draw.line((left - 12, mid - 12, left + 12, mid + 12), fill="#333333", width=4)
+        draw.line((left - 12, mid + 12, left + 12, mid + 36), fill="#333333", width=4)
+        draw.line((left + plot_w - 12, mid - 12, left + plot_w + 12, mid + 12), fill="#333333", width=4)
+        draw.line((left + plot_w - 12, mid + 12, left + plot_w + 12, mid + 36), fill="#333333", width=4)
+    def draw_series(symbol, color, panel):
+        segments = []; current = []
+        for i, (_, row) in enumerate(points):
+            if symbol in row and panel[2] <= row[symbol] <= panel[3]: current.append((int(x_at(i)), int(y_at(row[symbol], panel))))
+            elif len(current) > 1: segments.append(current); current = []
+        if len(current) > 1: segments.append(current)
+        for segment in segments: draw.line(segment, fill=color, width=6, joint="curve")
     for idx, symbol in enumerate(symbols):
-        coords = [(x_at(i), y_at(row[symbol])) for i, (_, row) in enumerate(points) if symbol in row]
-        if len(coords) > 1:
-            parts.append(f'<polyline fill="none" stroke="{colors[idx%len(colors)]}" stroke-width="4" points="' + " ".join(f"{x:.1f},{y:.1f}" for x,y in coords) + '"/>')
-    avg = []
-    for i, (_, row) in enumerate(points):
-        vals = [row[s] for s in symbols if s in row]
-        if vals: avg.append((x_at(i), y_at(sum(vals)/len(vals))))
-    if len(avg) > 1:
-        parts.append('<polyline fill="none" stroke="#000000" stroke-width="8" points="' + " ".join(f"{x:.1f},{y:.1f}" for x,y in avg) + '"/>')
+        for panel in panels: draw_series(symbol, colors[idx % len(colors)], panel)
+    for panel in panels:
+        y0, y1, low, high = panel
+        avg_points = []
+        for i, (_, row) in enumerate(points):
+            vals = [row[s] for s in symbols if s in row and low <= row[s] <= high]
+            if vals: avg_points.append((int(x_at(i)), int(y_at(sum(vals) / len(vals), panel))))
+        if len(avg_points) > 1: draw.line(avg_points, fill="#000000", width=10, joint="curve")
+    if points:
+        label_count = min(8, len(points)); step = max(1, (len(points) - 1) // (label_count - 1))
+        for i in range(0, len(points), step):
+            timestamp = points[i][0]
+            label = timestamp[11:16] if len(timestamp) >= 16 else str(i)
+            draw.line((int(x_at(i)), height - bottom, int(x_at(i)), height - bottom + 12), fill="#333333", width=2)
+            draw.text((int(x_at(i)), height - bottom + 25), label, fill="#333333", font=font(24), anchor="ma")
+    draw.text((left + plot_w // 2, height - 35), "زمان (از ۹:۳۰)", fill="#222222", font=font(28), anchor="ma")
+    draw.text((35, (top + height - bottom) // 2), "نمره", fill="#222222", font=font(28), anchor="mm")
+    legend_y = top + 15
     for idx, symbol in enumerate(symbols):
-        y = top + idx*42
-        parts.append(f'<line x1="{width-right+20}" y1="{y}" x2="{width-right+65}" y2="{y}" stroke="{colors[idx%len(colors)]}" stroke-width="6"/>')
-        parts.append(f'<text x="{width-right+80}" y="{y+8}">{symbol}</text>')
-    y = top + len(symbols)*42
-    parts.append(f'<line x1="{width-right+20}" y1="{y}" x2="{width-right+65}" y2="{y}" stroke="#000" stroke-width="8"/>')
-    parts.append(f'<text x="{width-right+80}" y="{y+8}">میانگین</text>')
-    parts.append(f'<text x="{left+plot_w/2}" y="{height-25}" text-anchor="middle">زمان (از ۹:۳۰)</text><text x="25" y="{top+plot_h/2}" transform="rotate(-90 25 {top+plot_h/2})" text-anchor="middle">نمره</text></svg>')
-    svg = "".join(parts)
-    svg_path = filename + ".svg"
-    with open(svg_path, "w", encoding="utf-8") as f: f.write(svg)
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        scale = 2
-        img = Image.new("RGB", (width * scale, height * scale), "white")
-        draw = ImageDraw.Draw(img)
-        def font(size):
-            try:
-                return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size * scale)
-            except OSError:
-                return ImageFont.load_default()
-        draw.rectangle((0, 0, width * scale - 1, height * scale - 1), outline="#bbbbbb", width=3)
-        draw.text((width * scale // 2, 28 * scale), title, fill="black", font=font(30), anchor="ma")
-        for i in range(6):
-            y = int((top + plot_h * i / 5) * scale)
-            draw.line((left * scale, y, (left + plot_w) * scale, y), fill="#dddddd", width=2)
-            val = hi - (hi - lo) * i / 5
-            draw.text(((left - 15) * scale, y), f"{val:.1f}", fill="#333333", font=font(20), anchor="rm")
-        for idx, symbol in enumerate(symbols):
-            coords = [(int(x * scale), int(y * scale)) for x, y in [(x_at(i), y_at(row[symbol])) for i, (_, row) in enumerate(points) if symbol in row]]
-            if len(coords) > 1:
-                draw.line(coords, fill=colors[idx % len(colors)], width=5 * scale, joint="curve")
-            ly = int((top + idx * 42) * scale)
-            draw.line(((width - right + 20) * scale, ly, (width - right + 65) * scale, ly), fill=colors[idx % len(colors)], width=6 * scale)
-            draw.text(((width - right + 80) * scale, ly), symbol, fill="black", font=font(22), anchor="lm")
-        if len(avg) > 1:
-            draw.line([(int(x * scale), int(y * scale)) for x, y in avg], fill="black", width=8 * scale, joint="curve")
-        ly = int((top + len(symbols) * 42) * scale)
-        draw.line(((width - right + 20) * scale, ly, (width - right + 65) * scale, ly), fill="black", width=8 * scale)
-        draw.text(((width - right + 80) * scale, ly), "میانگین", fill="black", font=font(22), anchor="lm")
-        img.save(filename, "PNG", optimize=True)
-
-    finally:
-        try: os.remove(svg_path)
-        except OSError: pass
+        y = legend_y + idx * 52
+        color = colors[idx % len(colors)]
+        draw.line((width - right + 20, y, width - right + 85, y), fill=color, width=7)
+        draw.text((width - right + 105, y), symbol, fill="#111111", font=font(27), anchor="lm")
+    y = legend_y + len(symbols) * 52
+    draw.line((width - right + 20, y, width - right + 85, y), fill="#000000", width=10)
+    draw.text((width - right + 105, y), "میانگین", fill="#111111", font=font(27), anchor="lm")
+    if outlier:
+        draw.text((left + 20, 665), "مقیاس شکسته برای نمایش بهتر نقاط پرت", fill="#555555", font=font(22))
+    img.save(filename, "PNG", optimize=True)
     return filename
 
 
