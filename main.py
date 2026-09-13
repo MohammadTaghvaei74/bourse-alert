@@ -433,12 +433,7 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
         previous_leader_median = previous[6] if previous and len(previous) > 6 else None
         leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0
         leader_average_delta = leader_average - previous_leader_average if previous_leader_average is not None else 0
-        allocation_gap = median - leader_median
-        allocation_signal = market_allocation_signal(median, leader_median)
         lines.extend([
-            f"📍 اختلاف میانه کل بازار و لیدرها: {ltr_signed(allocation_gap)}",
-            f"🧭 تمایل پول: {allocation_signal}",
-            "",
             "👑 <b>لیدرها</b>",
             f"میانه: {ltr_signed(leader_median)} | قبل: {ltr_signed(leader_median_delta)}",
             f"میانگین: {ltr_signed(leader_average)} | قبل: {ltr_signed(leader_average_delta)}",
