@@ -323,6 +323,8 @@ def attach_industries(stocks, session=None):
     client = session or requests.Session()
     changed = False
     for stock in stocks:
+        if not (stock.get("eligible_market_stock") and float(stock.get("trade_volume", 0)) > 0):
+            continue
         code = stock.get("instrument")
         if not code:
             continue
@@ -404,14 +406,9 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines = [
         "📊 <b>#وضعیت_بازار</b>",
         "",
-        f"📌 میانه بازار: {status_stars(median_status)}",
-        f"⚖️ اختلاف عرضه و تقاضا: {status_stars(imbalance_status)}",
+        f"⭐ نمره میانه: {status_stars(median_status)}",
+        f"⚖️ سربار تقاضا خالص: {status_stars(imbalance_status)}",
         f"💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
-        "",
-        "🏦 <b>کل بازار</b>",
-        f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
-        f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
-        f"تعداد سهام معامله‌شده: {count}",
         "",
     ]
     if leader_stats is not None:
@@ -423,6 +420,15 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
             f"🧭 تمایل پول: {allocation_signal}",
             "",
         ])
+    lines.extend([
+        "🏦 <b>کل بازار</b>",
+        f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
+        f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
+        f"تعداد سهام معامله‌شده: {count}",
+        "",
+    ]
+    if leader_stats is not None:
+        leader_average, leader_median = leader_stats
         previous_leader_average = previous[5] if previous and len(previous) > 5 else None
         previous_leader_median = previous[6] if previous and len(previous) > 6 else None
         leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0

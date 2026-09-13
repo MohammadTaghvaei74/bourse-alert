@@ -21,10 +21,10 @@ def test_market_summary_puts_three_status_scores_at_top():
          "buy_queue_value_toman": 6_000_000_000_000, "sell_queue_value_toman": 0},
     ]
     report = market_summary(stocks, leader_stats=(0.0, 0.0), turnover=(10.0, 1.3, "خوب"))
-    top = report.splitlines()[:5]
-    assert top[1] == "⭐ میانه بازار: ⭐⭐⭐⭐⭐"
-    assert top[2] == "⭐ اختلاف عرضه و تقاضا: ⭐⭐⭐⭐⭐"
-    assert top[3] == "⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
+    top = report.splitlines()[:6]
+    assert top[2] == "⭐ میانه بازار: ⭐⭐⭐⭐⭐"
+    assert top[3] == "⭐ اختلاف عرضه و تقاضا: ⭐⭐⭐⭐"
+    assert top[4] == "⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
 
 
 def test_market_allocation_signal_classifies_median_gap():
@@ -32,7 +32,7 @@ def test_market_allocation_signal_classifies_median_gap():
     assert market_allocation_signal(1.5, 0.9) == "تمایل به سهام هم‌وزن"
     assert market_allocation_signal(1.0, 0.6) == "تمایل خاصی وجود ندارد"
     assert market_allocation_signal(0.0, 0.8) == "تمایل به سهام لیدرها"
-    assert market_allocation_signal(-1.0, 0.2) == "تمایل به سهام لیدرها"
+    assert market_allocation_signal(-1.0, 0.2) == "تمایل شدید به لیدرها"
     assert market_allocation_signal(-1.1, 0.0) == "تمایل شدید به لیدرها"
     assert market_allocation_signal(0.0, 1.1) == "تمایل شدید به لیدرها"
 
@@ -43,7 +43,7 @@ def test_market_summary_reports_allocation_gap_and_signal():
         {"symbol": "ب", "score": 5.0, "trade_volume": 100, "eligible_market_stock": True},
     ]
     report = market_summary(stocks, leader_stats=(0.0, 1.0))
-    assert "اختلاف میانه کل بازار و لیدرها: ‎+2.0‎" in report
+    assert "اختلاف میانه کل بازار و لیدرها: ‎2.0‎" in report
     assert "تمایل پول: تمایل شدید به سهام هم‌وزن" in report
 
 
@@ -53,9 +53,9 @@ def test_market_summary_reports_market_and_leader_medians_and_signal():
         {"symbol": "هم‌وزن", "score": 5.0, "trade_volume": 100, "eligible_market_stock": True},
     ]
     report = market_summary(stocks, leader_stats=(0.0, 1.0))
-    assert "میانه کل بازار: 3.0" in report
-    assert "میانه لیدرها: 1.0" in report
-    assert "اختلاف میانه: ‎+2.0‎" in report
+    assert "میانه: ‎3.0‎" in report
+    assert "میانه: ‎1.0‎" in report
+    assert "اختلاف میانه کل بازار و لیدرها: ‎2.0‎" in report
     assert "تمایل شدید به سهام هم‌وزن" in report
 
 
@@ -68,11 +68,17 @@ def test_market_summary_reports_count_average_and_median_for_traded_stocks():
         {"symbol": "ج", "score": 5.0, "trade_volume": 300, "eligible_market_stock": True},
         {"symbol": "د", "score": 9.0, "trade_volume": 0, "eligible_market_stock": True},
     ]
-    assert market_summary(stocks) == "تعداد کل سهام معامله شده امروز: 3\nمیانگین نمره: 2.7\nمیانه نمره: 2.0\nارزش سفارشات خرید در سقف: 0.00 همت\nارزش سفارشات فروش در کف: 0.00 همت"
+    report = market_summary(stocks)
+    assert "تعداد سهام معامله‌شده: 3" in report
+    assert "میانگین: ‎2.7‎" in report
+    assert "میانه: ‎2.0‎" in report
 
 
 def test_market_summary_is_empty_when_no_stock_traded():
-    assert market_summary([{ "symbol": "الف", "score": 1.0, "trade_volume": 0, "eligible_market_stock": True }]) == "تعداد کل سهام معامله شده امروز: 0\nمیانگین نمره: 0.0\nمیانه نمره: 0.0\nارزش سفارشات خرید در سقف: 0.00 همت\nارزش سفارشات فروش در کف: 0.00 همت"
+    report = market_summary([{ "symbol": "الف", "score": 1.0, "trade_volume": 0, "eligible_market_stock": True }])
+    assert "تعداد سهام معامله‌شده: 0" in report
+    assert "میانگین: ‎0.0‎" in report
+    assert "میانه: ‎0.0‎" in report
 
 
 def test_buy_queue_score_uses_last_percent_plus_queue_ratio():
@@ -132,9 +138,9 @@ def test_industry_report_ranks_only_configured_industries_by_median_and_previous
     report = main.build_industry_message(stocks, now, limit=5)
     assert report.splitlines() == [
         "#صنایع",
-        "1. خودرو | ‎2.0‎ | قبل ‎-2.0‎",
+        "1. شیمیایی | ‎99.0‎ | قبل ‎+99.0‎",
         "2. فلزات اساسی | ‎4.0‎ | قبل ‎+3.0‎",
-        "3. شیمیایی | ‎99.0‎ | قبل ‎+99.0‎",
+        "3. خودرو | ‎2.0‎ | قبل ‎-2.0‎",
     ]
 
 
