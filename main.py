@@ -4,6 +4,7 @@ import os
 import sqlite3
 import statistics
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -76,6 +77,11 @@ def init_db():
         if "leader_median" not in columns:
             conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_median REAL NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(timestamp)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS daily_market_stats (
+            trading_date TEXT PRIMARY KEY,
+            turnover_hmt REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
         conn.commit()
 
 
@@ -206,7 +212,7 @@ def parse_market_data(stocks_raw, depth_raw):
                 side, volume, price = "sell", sell_volume, best_sell_price
             else:
                 side, volume, price = None, 0, 0
-            result.append({"symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
+            result.append({"symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
         except (ValueError, IndexError, ZeroDivisionError):
             continue
     return result
@@ -222,13 +228,132 @@ def market_summary_values(stocks):
     return len(scores), average, median, buy_value_hmt, sell_value_hmt
 
 
-def market_summary(stocks, previous=None):
+def market_allocation_signal(market_median, leader_median):
+    gap = float(market_median) - float(leader_median)
+    if gap > 1.0:
+        return "تمایل شدید به سهام هم‌وزن"
+    if gap >= 0.5:
+        return "تمایل به سهام هم‌وزن"
+    if gap < -1.0 and float(market_median) < -1.0:
+        return "تمایل شدید به لیدرها"
+    if gap <= -0.5:
+        return "تمایل به سهام لیدرها"
+    return "تمایل خاصی وجود ندارد"
+
+
+def classify_median(value):
+    if value > 2: return "عالی"
+    if value > 1: return "خوب"
+    if value >= -1: return "معمولی"
+    if value >= -2: return "بد"
+    return "افتضاح"
+
+
+def classify_imbalance(value):
+    if value > 20: return "عالی"
+    if value > 5: return "خوب"
+    if value >= -5: return "معمولی"
+    if value >= -20: return "بد"
+    return "افتضاح"
+
+
+def classify_turnover_ratio(value):
+    if value is None: return "داده کافی نیست"
+    if value > 1.5: return "عالی"
+    if value >= 1.2: return "خوب"
+    if value >= 0.8: return "معمولی"
+    if value >= 0.6: return "بد"
+    return "افتضاح"
+
+
+def update_daily_turnover(stocks, now):
+    turnover_hmt = sum(float(s.get("trade_value_toman", 0)) for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0) / 1_000_000_000_000
+    date = now.date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR REPLACE INTO daily_market_stats VALUES (?, ?, ?)", (date, turnover_hmt, now.isoformat()))
+        rows = conn.execute("SELECT turnover_hmt FROM daily_market_stats ORDER BY trading_date DESC LIMIT 10").fetchall()
+    values = [row[0] for row in rows]
+    ratio = sum(values[:3]) / 3 / (sum(values[:10]) / len(values)) if len(values) >= 10 and sum(values[:10]) else None
+    return turnover_hmt, ratio, classify_turnover_ratio(ratio)
+
+
+CONFIGURED_INDUSTRIES = ("فلزات اساسی", "خودرو", "شیمیایی")
+
+
+def industry_stats(stocks):
+    """Return traded, configured industries with their current median score."""
+    grouped = defaultdict(list)
+    for stock in stocks:
+        industry = stock.get("industry")
+        if (
+            industry in CONFIGURED_INDUSTRIES
+            and stock.get("eligible_market_stock")
+            and float(stock.get("trade_volume", 0)) > 0
+        ):
+            grouped[industry].append(float(stock["score"]))
+    return [
+        {"industry": industry, "median": statistics.median(scores)}
+        for industry, scores in grouped.items()
+    ]
+
+
+def save_industry_snapshot(values, now):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS industry_snapshots (timestamp TEXT NOT NULL, industry TEXT NOT NULL, median REAL NOT NULL, PRIMARY KEY(timestamp, industry))"
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO industry_snapshots(timestamp, industry, median) VALUES (?, ?, ?)",
+            [(now.isoformat(), industry, float(median)) for industry, median in values.items()],
+        )
+
+
+def build_industry_message(stocks, now, limit=None):
+    current = industry_stats(stocks)
+    if not current:
+        return "#صنایع"
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS industry_snapshots (timestamp TEXT NOT NULL, industry TEXT NOT NULL, median REAL NOT NULL, PRIMARY KEY(timestamp, industry))"
+        )
+        old_rows = conn.execute(
+            "SELECT industry, median FROM industry_snapshots WHERE timestamp < ? ORDER BY timestamp DESC",
+            (now.isoformat(),),
+        ).fetchall()
+    previous = {}
+    for industry, median in old_rows:
+        previous.setdefault(industry, median)
+    ranked = sorted(current, key=lambda item: item["median"])
+    if limit:
+        ranked = ranked[:limit]
+    lines = ["#صنایع"]
+    for index, item in enumerate(ranked, 1):
+        delta = item["median"] - float(previous.get(item["industry"], 0.0))
+        lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل {ltr_signed(delta)}")
+    return "\n".join(lines)
+
+
+def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     count, average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
     lines = [f"تعداد کل سهام معامله شده امروز: {count}",
              f"میانگین نمره: {average:.1f}",
-             f"میانه نمره: {median:.1f}",
+             f"میانه نمره: {median:.1f} | وضعیت: {classify_median(median)}",
              f"ارزش سفارشات خرید در سقف: {buy_hmt:.2f} همت",
-             f"ارزش سفارشات فروش در کف: {sell_hmt:.2f} همت"]
+             f"ارزش سفارشات فروش در کف: {sell_hmt:.2f} همت",
+             f"اختلاف صف خرید و فروش: {buy_hmt - sell_hmt:.2f} همت | وضعیت: {classify_imbalance(buy_hmt - sell_hmt)}"]
+
+    if leader_stats is not None:
+        leader_average, leader_median = leader_stats
+        lines.extend([
+            f"میانه کل بازار: {median:.1f}",
+            f"میانه لیدرها: {float(leader_median):.1f}",
+            f"اختلاف میانه: ‎{median - float(leader_median):+.1f}‎",
+            market_allocation_signal(median, leader_median),
+        ])
+    if turnover is not None:
+        turnover_hmt, turnover_ratio, turnover_status = turnover
+        ratio_text = f"نسبت ۳/۱۰روزه: {turnover_ratio:.2f}" if turnover_ratio is not None else "نسبت ۳/۱۰روزه: داده کافی نیست"
+        lines.extend([f"روند ارزش معاملات: {turnover_status}", f"ارزش معاملات امروز: {turnover_hmt:.2f} همت | {ratio_text}"])
     if previous:
         lines.extend([f"قبل: تعداد {count - previous[0]:+.0f} | میانگین {average - previous[1]:+.1f} | میانه {median - previous[2]:+.1f} | خرید {buy_hmt - previous[3]:+.2f} | فروش {sell_hmt - previous[4]:+.2f}"])
     return "\n".join(lines)
@@ -247,7 +372,8 @@ def previous_market_snapshot(now):
 
 
 def market_group_average_median(stocks):
-    scores = [float(s["score"]) for s in stocks]
+    scores = [float(s["score"]) for s in stocks
+              if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
     return (statistics.mean(scores), statistics.median(scores)) if scores else (0.0, 0.0)
 
 
@@ -387,18 +513,50 @@ def _snapshot_points(now):
     return rows
 
 
+def should_send_market_chart(now):
+    """Return True only on a ten-minute boundary during the report window."""
+    return (
+        now.minute % 10 == 0
+        and now >= now.replace(hour=9, minute=30, second=0, microsecond=0)
+        and now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
+    )
+
+
+def seconds_until_next_minute(now):
+    """Keep the polling loop aligned so it cannot drift past report minutes."""
+    return max(0.1, 60 - now.second - now.microsecond / 1_000_000)
+
+
 def create_market_charts(now, chart_dir):
     from PIL import Image, ImageDraw, ImageFont
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+
+        def rtl(text):
+            return get_display(arabic_reshaper.reshape(str(text)))
+    except ImportError:
+        def rtl(text):
+            return str(text)
+
     rows = _snapshot_points(now)
     if len(rows) < 2:
         return []
     os.makedirs(chart_dir, exist_ok=True)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_paths = [
+        "C:/Windows/Fonts/tahoma.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
     def font(size):
-        try: return ImageFont.truetype(font_path, size)
-        except OSError: return ImageFont.load_default()
+        for font_path in font_paths:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
     colors = ["#1565c0", "#d84315", "#2e7d32", "#8e24aa"]
-    labels = ["میانه کل بازار", "میانگین کل بازار", "میانه لیدر", "میانگین لیدر"]
+    labels = ["میانه کل بازار", "میانگین کل بازار", "میانه لیدرها", "میانگین لیدرها"]
     times = [r[0] for r in rows]
     def render(title, series, legend, path, ylabel):
         width, height = 2200, 1250; left, right, top, bottom = 150, 430, 120, 180
@@ -409,7 +567,7 @@ def create_market_charts(now, chart_dir):
         def x(i): return left + i*pw/max(len(rows)-1,1)
         def y(v): return top + (high-v)*ph/max(high-low,1e-9)
         draw.rectangle((0,0,width-1,height-1), outline="#bdbdbd", width=3)
-        draw.text((width//2,35), title, fill="#111", font=font(38), anchor="ma")
+        draw.text((width//2,35), rtl(title), fill="#111", font=font(38), anchor="ma")
         for k in range(7):
             val=high-(high-low)*k/6; yy=int(top+ph*k/6)
             draw.line((left,yy,left+pw,yy), fill="#e0e0e0", width=2); draw.text((left-18,yy),f"{val:.1f}",fill="#333",font=font(23),anchor="rm")
@@ -418,16 +576,25 @@ def create_market_charts(now, chart_dir):
         step=max(1,(len(rows)-1)//7)
         for i in range(0,len(rows),step):
             draw.text((int(x(i)),height-bottom+25),times[i][11:16],fill="#333",font=font(24),anchor="ma")
-        draw.text((left+pw//2,height-35),"زمان",fill="#222",font=font(28),anchor="ma"); draw.text((35,(top+height-bottom)//2),ylabel,fill="#222",font=font(28),anchor="mm")
+        draw.text((left+pw//2,height-35),rtl("زمان"),fill="#222",font=font(28),anchor="ma"); draw.text((35,(top+height-bottom)//2),rtl(ylabel),fill="#222",font=font(28),anchor="mm")
         for j,name in enumerate(legend):
-            yy=top+15+j*58; draw.line((width-right+20,yy,width-right+85,yy),fill=colors[j],width=8); draw.text((width-right+105,yy),name,fill="#111",font=font(27),anchor="lm")
+            yy=top+15+j*58; draw.line((width-right+20,yy,width-right+85,yy),fill=colors[j],width=8); draw.text((width-right+105,yy),rtl(name),fill="#111",font=font(27),anchor="lm")
         img.save(path,"PNG",optimize=True); return path
-    score_path=render("#وضعیت بازار - روند نمره", [[r[2], r[2]] for r in rows], labels, os.path.join(chart_dir,"market_scores.png"), "نمره")
-    # Build each series across snapshots, keeping the four requested lines.
-    score_path=render("#وضعیت بازار - روند نمره", [[r[2] for r in rows],[r[1] for r in rows],[r[4] for r in rows],[r[3] for r in rows]], labels, os.path.join(chart_dir,"market_scores.png"), "نمره")
-    imbalance=[r[5]-r[6] for r in rows]
-    imbalance_path=render("#وضعیت بازار - اختلاف صف خرید و فروش", [imbalance], ["خرید - فروش"], os.path.join(chart_dir,"market_imbalance.png"), "همت")
-    return [score_path, imbalance_path]
+    # Columns are: timestamp, market average, market median,
+    # leader average, leader median, buy queue, sell queue.
+    score_path = render(
+        "#وضعیت بازار - روند نمره",
+        [
+            [r[2] for r in rows],
+            [r[1] for r in rows],
+            [r[4] for r in rows],
+            [r[3] for r in rows],
+        ],
+        labels,
+        os.path.join(chart_dir, "market_scores.png"),
+        "نمره",
+    )
+    return [score_path]
 
 
 def send_telegram_photo(filename, caption, session=None):
@@ -445,7 +612,7 @@ def send_telegram_photo(filename, caption, session=None):
 
 def run_pipeline(session=None, now=None):
     now = now or datetime.now(TEHRAN)
-    send_reports = now >= now.replace(hour=9, minute=30, second=0, microsecond=0)
+    send_reports = should_send_market_chart(now)
     stocks_raw, depth_raw = fetch_market_data(session)
     data = parse_market_data(stocks_raw, depth_raw)
     stock_dict = {s["symbol"]: s for s in data}
@@ -459,9 +626,10 @@ def run_pipeline(session=None, now=None):
     market_values = market_summary_values(data)
     market_previous = previous_market_snapshot(now)
     leader_average, leader_median = market_group_average_median(leaders)
+    turnover = update_daily_turnover(data, now)
     save_market_snapshot(market_values, now, leader_average, leader_median)
     if send_reports:
-        send_telegram(market_summary(data, market_previous), session)
+        send_telegram(market_summary(data, market_previous, (leader_average, leader_median), turnover), session)
         send_telegram(build_group_message("#اهرمی", leveraged, now), session)
         send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
     if send_reports:
@@ -474,7 +642,7 @@ def run_pipeline(session=None, now=None):
         if leaders_chart:
             send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۱۰ لیدر برتر", session)
         market_charts = create_market_charts(now, chart_dir)
-        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۴ روند نمره", "#وضعیت بازار - اختلاف صف خرید و فروش")):
+        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۴ روند نمره",)):
             send_telegram_photo(chart, caption, session)
     return len(data)
 
@@ -491,7 +659,7 @@ def main():
         try:
             if is_market_open():
                 run_pipeline()
-                time.sleep(120)
+                time.sleep(seconds_until_next_minute(datetime.now(TEHRAN)))
             else:
                 time.sleep(60)
         except Exception:
@@ -505,10 +673,14 @@ def send_current_market_summary():
     values = market_summary_values(data)
     now = datetime.now(TEHRAN)
     previous = previous_market_snapshot(now)
-    message = market_summary(data, previous)
-    result = send_telegram(message)
+    stock_dict = {s["symbol"]: s for s in data}
+    leaders = [stock_dict[s] for s in LEADERS if s in stock_dict]
+    leader_stats = market_group_average_median(leaders)
     init_db()
-    save_market_snapshot(values, now)
+    turnover = update_daily_turnover(data, now)
+    message = market_summary(data, previous, leader_stats, turnover)
+    result = send_telegram(message)
+    save_market_snapshot(values, now, *leader_stats)
     return result
 
 
