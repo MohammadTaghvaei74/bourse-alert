@@ -212,7 +212,7 @@ def parse_market_data(stocks_raw, depth_raw):
                 side, volume, price = "sell", sell_volume, best_sell_price
             else:
                 side, volume, price = None, 0, 0
-            result.append({"symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
+            result.append({"instrument": instrument, "symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
         except (ValueError, IndexError, ZeroDivisionError):
             continue
     return result
@@ -234,7 +234,7 @@ def market_allocation_signal(market_median, leader_median):
         return "تمایل شدید به سهام هم‌وزن"
     if gap >= 0.5:
         return "تمایل به سهام هم‌وزن"
-    if gap < -1.0 and float(market_median) < -1.0:
+    if gap < -1.0:
         return "تمایل شدید به لیدرها"
     if gap <= -0.5:
         return "تمایل به سهام لیدرها"
@@ -288,7 +288,58 @@ def update_daily_turnover(stocks, now):
     return turnover_hmt, ratio, classify_turnover_ratio(ratio)
 
 
-CONFIGURED_INDUSTRIES = ("فلزات اساسی", "خودرو", "شیمیایی")
+CONFIGURED_INDUSTRIES = (
+    "فلزات اساسی", "خودرو", "محصولات دارویی", "محصولات غذایی", "سیمان",
+    "شرکتهای چند رشته ای", "شیمیایی", "بانک", "فراورده های نفتی",
+    "استخراج کانه فلزی", "زراعت", "محصولات فلزی", "کاشی سرامیک",
+)
+
+INDUSTRY_NAMES = {
+    "فلزات اساسي": "فلزات اساسی", "فلزات اساسی": "فلزات اساسی",
+    "محصولات دارويي": "محصولات دارویی", "محصولات دارویی": "محصولات دارویی",
+    "محصولات غذايي": "محصولات غذایی", "محصولات غذایی": "محصولات غذایی",
+    "سيمان": "سیمان", "سیمان": "سیمان", "شيميايي": "شیمیایی", "شیمیایی": "شیمیایی",
+    "بانکها و موسسات اعتباری": "بانک", "بانک": "بانک",
+    "فراورده هاي نفتي": "فراورده های نفتی", "فراورده های نفتی": "فراورده های نفتی",
+    "استخراج کانه هاي فلزي": "استخراج کانه فلزی", "استخراج کانه فلزی": "استخراج کانه فلزی",
+    "محصولات فلزي": "محصولات فلزی", "محصولات فلزی": "محصولات فلزی",
+    "کاشي و سراميک": "کاشی سرامیک", "کاشی و سرامیک": "کاشی سرامیک",
+    "چند رشته ای": "شرکتهای چند رشته ای", "شرکتهای چند رشته ای": "شرکتهای چند رشته ای",
+}
+
+
+def normalize_industry(name):
+    return INDUSTRY_NAMES.get(str(name or "").replace("ي", "ی").replace("ك", "ک").strip())
+
+
+def attach_industries(stocks, session=None):
+    """Attach TSE sector names; cache them so only unknown instruments hit TSE."""
+    cache_path = os.path.join(os.path.dirname(DB_PATH) or ".", "industry_cache.json")
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError):
+        cache = {}
+    client = session or requests.Session()
+    changed = False
+    for stock in stocks:
+        code = stock.get("instrument")
+        if not code:
+            continue
+        if code not in cache:
+            try:
+                payload = client.get(f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{code}", timeout=10).json()
+                sector = payload.get("instrumentInfo", {}).get("sector", {}).get("lSecVal")
+                cache[code] = normalize_industry(sector)
+                changed = True
+            except (OSError, ValueError, requests.RequestException):
+                continue
+        stock["industry"] = cache.get(code)
+    if changed:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False)
+    return stocks
 
 
 def industry_stats(stocks):
@@ -334,7 +385,7 @@ def build_industry_message(stocks, now, limit=None):
     previous = {}
     for industry, median in old_rows:
         previous.setdefault(industry, median)
-    ranked = sorted(current, key=lambda item: item["median"])
+    ranked = sorted(current, key=lambda item: item["median"], reverse=True)
     if limit:
         ranked = ranked[:limit]
     lines = ["#صنایع"]
@@ -353,19 +404,25 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines = [
         "📊 <b>#وضعیت_بازار</b>",
         "",
-        f"⭐ میانه بازار: {status_stars(median_status)}",
-        f"⭐ اختلاف عرضه و تقاضا: {status_stars(imbalance_status)}",
-        f"⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
+        f"📌 میانه بازار: {status_stars(median_status)}",
+        f"⚖️ اختلاف عرضه و تقاضا: {status_stars(imbalance_status)}",
+        f"💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
         "",
         "🏦 <b>کل بازار</b>",
         f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
         f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
         f"تعداد سهام معامله‌شده: {count}",
-        f"وضعیت میانه: {median_status}",
         "",
     ]
     if leader_stats is not None:
         leader_average, leader_median = leader_stats
+        allocation_gap = median - leader_median
+        allocation_signal = market_allocation_signal(median, leader_median)
+        lines.extend([
+            f"📍 اختلاف میانه کل بازار و لیدرها: {ltr_signed(allocation_gap)}",
+            f"🧭 تمایل پول: {allocation_signal}",
+            "",
+        ])
         previous_leader_average = previous[5] if previous and len(previous) > 5 else None
         previous_leader_median = previous[6] if previous and len(previous) > 6 else None
         leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0
@@ -381,7 +438,7 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines.extend([
         f"🟢 خرید: {buy_hmt:.2f} همت | قبل: {buy_delta:.2f} همت",
         f"🔴 فروش: {sell_hmt:.2f} همت | قبل: {sell_delta:.2f} همت",
-        f"⚖️ اختلاف صف: {imbalance:.2f} همت | وضعیت: {imbalance_status}",
+        f"⚖️ اختلاف صف: {imbalance:.2f} همت",
     ])
     if turnover is not None:
         turnover_hmt, turnover_ratio, turnover_status = turnover
@@ -390,7 +447,6 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
             "",
             "💧 <b>ارزش معاملات</b>",
             f"امروز: {turnover_hmt:.2f} همت | نسبت ۳/۱۰روزه: {ratio_text}",
-            f"وضعیت: {turnover_status}",
         ])
     return "\n".join(lines)
 
@@ -659,6 +715,10 @@ def run_pipeline(session=None, now=None):
         return 0
     init_db()
     save_scores(data, now)
+    attach_industries(data, session)
+    industry_values = {item["industry"]: item["median"] for item in industry_stats(data)}
+    industry_message = build_industry_message(data, now, limit=5)
+    save_industry_snapshot(industry_values, now)
     market_values = market_summary_values(data)
     market_previous = previous_market_snapshot(now)
     leader_average, leader_median = market_group_average_median(leaders)
@@ -668,6 +728,7 @@ def run_pipeline(session=None, now=None):
         send_telegram(market_summary(data, market_previous, (leader_average, leader_median), turnover), session)
         send_telegram(build_group_message("#اهرمی", leveraged, now), session)
         send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
+        send_telegram(industry_message, session)
     if send_reports:
         chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
         os.makedirs(chart_dir, exist_ok=True)
