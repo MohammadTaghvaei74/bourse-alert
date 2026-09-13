@@ -7,9 +7,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import struct
+import zlib
 
 DB_PATH = os.getenv("DB_PATH", "/root/bourse-alert/scores_history.db")
 TSETMC_URL = "https://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx"
@@ -224,31 +223,58 @@ def _chart_points(symbols, now):
     return [(timestamp, values) for timestamp, values in sorted(points.items())]
 
 
+def _png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+
+
 def create_score_chart(title, stocks, now, filename):
+    """Create a dependency-free PNG line chart from today's score snapshots."""
     symbols = [s["symbol"] for s in stocks]
     points = _chart_points(symbols, now)
     if not points:
         return None
-    times = [datetime.fromisoformat(t).astimezone(TEHRAN).strftime("%H:%M") for t, _ in points]
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
-    for symbol in symbols:
+    width, height = 1400, 760
+    pixels = [[(255, 255, 255) for _ in range(width)] for _ in range(height)]
+    margin = (90, 45, 70, 80)
+    x0, x1 = margin[0], width - margin[1]
+    y0, y1 = margin[2], height - margin[3]
+    all_values = [v for _, row in points for v in row.values()]
+    if not all_values:
+        return None
+    lo, hi = min(all_values), max(all_values)
+    span = max(hi - lo, 1.0)
+    lo -= span * 0.08; hi += span * 0.08
+    palette = [(31,119,180),(255,127,14),(44,160,44),(214,39,40),(148,103,189),(140,86,75)]
+
+    def put(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            pixels[y][x] = color
+
+    def line(a, b, color, thickness=1):
+        ax, ay = a; bx, by = b; steps = max(abs(bx-ax), abs(by-ay), 1)
+        for i in range(steps + 1):
+            x = round(ax + (bx-ax)*i/steps); y = round(ay + (by-ay)*i/steps)
+            for dx in range(-thickness, thickness+1):
+                for dy in range(-thickness, thickness+1): put(x+dx, y+dy, color)
+
+    line((x0, y0), (x0, y1), (40,40,40), 2); line((x0, y1), (x1, y1), (40,40,40), 2)
+    for idx, symbol in enumerate(symbols):
         values = [row.get(symbol) for _, row in points]
-        if any(value is not None for value in values):
-            ax.plot(times, values, marker="o", linewidth=1.8, markersize=3, label=symbol)
+        coords = [(x0 + round(i*(x1-x0)/max(len(points)-1,1)), y1-round((v-lo)/(hi-lo)*(y1-y0))) for i,v in enumerate(values) if v is not None]
+        for a,b in zip(coords, coords[1:]): line(a,b,palette[idx % len(palette)],2)
+        for x,y in coords: line((x-4,y),(x+4,y),palette[idx % len(palette)],2)
     averages = []
     for _, row in points:
-        values = [row[s] for s in symbols if s in row]
-        averages.append(sum(values) / len(values) if values else None)
-    ax.plot(times, averages, color="black", linewidth=4, label="میانگین")
-    ax.set_title(title, fontsize=16, fontweight="bold")
-    ax.set_xlabel("زمان")
-    ax.set_ylabel("نمره")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=8)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(filename, format="png")
-    plt.close(fig)
+        vals = [row[s] for s in symbols if s in row]
+        averages.append(sum(vals)/len(vals) if vals else None)
+    coords = [(x0 + round(i*(x1-x0)/max(len(points)-1,1)), y1-round((v-lo)/(hi-lo)*(y1-y0))) for i,v in enumerate(averages) if v is not None]
+    for a,b in zip(coords, coords[1:]): line(a,b,(0,0,0),5)
+    raw = b"".join(b"\x00" + b"".join(bytes(p) for p in row) for row in pixels)
+    png = (bytes([137, 80, 78, 71, 13, 10, 26, 10]) +
+           _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+           _png_chunk(b"IDAT", zlib.compress(raw, 6)) +
+           _png_chunk(b"IEND", b""))
+    with open(filename, "wb") as image: image.write(png)
     return filename
 
 
