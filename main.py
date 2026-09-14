@@ -1,4 +1,7 @@
+import gzip
+import hashlib
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -8,10 +11,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import json
-import os
-import subprocess
-import tempfile
 import requests
 
 DB_PATH = os.getenv("DB_PATH", "/root/bourse-alert/scores_history.db")
@@ -77,18 +76,92 @@ def init_db():
         if "leader_median" not in columns:
             conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_median REAL NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(timestamp)")
+
+        conn.execute("""CREATE TABLE IF NOT EXISTS stock_snapshots (
+            timestamp TEXT NOT NULL,
+            trading_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            instrument TEXT,
+            industry TEXT,
+            instrument_type TEXT,
+            yesterday_price REAL,
+            close_price REAL,
+            last_price REAL,
+            last_pct REAL,
+            trade_volume REAL,
+            trade_value_toman REAL,
+            buy_queue_volume REAL,
+            sell_queue_volume REAL,
+            buy_queue_value_toman REAL,
+            sell_queue_value_toman REAL,
+            score REAL,
+            valid INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(timestamp, symbol)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_snapshots_date_symbol ON stock_snapshots(trading_date, symbol)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS group_snapshots (
+            timestamp TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            average REAL NOT NULL,
+            median REAL NOT NULL,
+            turnover_toman REAL NOT NULL,
+            buy_value_hmt REAL NOT NULL,
+            sell_value_hmt REAL NOT NULL,
+            net_queue_hmt REAL NOT NULL,
+            PRIMARY KEY(timestamp, group_name)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS industry_detail_snapshots (
+            timestamp TEXT NOT NULL,
+            industry TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            average REAL NOT NULL,
+            median REAL NOT NULL,
+            turnover_toman REAL NOT NULL,
+            buy_value_hmt REAL NOT NULL,
+            sell_value_hmt REAL NOT NULL,
+            net_queue_hmt REAL NOT NULL,
+            PRIMARY KEY(timestamp, industry)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS raw_tse_snapshots (
+            timestamp TEXT PRIMARY KEY,
+            trading_date TEXT NOT NULL,
+            stocks_path TEXT NOT NULL,
+            depth_path TEXT NOT NULL,
+            stocks_bytes INTEGER NOT NULL,
+            depth_bytes INTEGER NOT NULL,
+            stocks_sha256 TEXT NOT NULL,
+            depth_sha256 TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS daily_stock_summary (
+            trading_date TEXT NOT NULL, symbol TEXT NOT NULL, industry TEXT,
+            snapshot_count INTEGER NOT NULL, final_volume REAL, final_turnover_toman REAL,
+            average_score REAL, median_score REAL, min_score REAL, max_score REAL, last_score REAL,
+            max_buy_queue_toman REAL, max_sell_queue_toman REAL,
+            PRIMARY KEY(trading_date, symbol)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS daily_market_summary (
+            trading_date TEXT PRIMARY KEY, snapshot_count INTEGER NOT NULL,
+            traded_stock_count INTEGER NOT NULL, average_score REAL, median_score REAL,
+            final_turnover_toman REAL, final_buy_value_hmt REAL, final_sell_value_hmt REAL,
+            average_net_queue_hmt REAL, final_net_queue_hmt REAL,
+            turnover_ratio_3_10 REAL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS daily_market_stats (
             trading_date TEXT PRIMARY KEY,
             turnover_hmt REAL NOT NULL,
             updated_at TEXT NOT NULL
         )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_snapshots_timestamp ON stock_snapshots(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_group_snapshots_timestamp ON group_snapshots(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_industry_detail_snapshots_timestamp ON industry_detail_snapshots(timestamp)")
         conn.commit()
 
 
 def save_scores(stocks, now):
     with sqlite3.connect(DB_PATH) as conn:
         conn.executemany("INSERT INTO history(symbol, score, timestamp) VALUES (?, ?, ?)", [(s["symbol"], s["score"], now.isoformat()) for s in stocks])
-        conn.execute("DELETE FROM history WHERE timestamp < ?", ((now - timedelta(days=7)).isoformat(),))
+        conn.execute("DELETE FROM history WHERE timestamp < ?", ((now - timedelta(days=31)).isoformat(),))
 
 
 def _snapshot_avg(symbols, start=None, end=None):
@@ -212,7 +285,7 @@ def parse_market_data(stocks_raw, depth_raw):
                 side, volume, price = "sell", sell_volume, best_sell_price
             else:
                 side, volume, price = None, 0, 0
-            result.append({"instrument": instrument, "symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
+            result.append({"instrument": instrument, "symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "instrument_type": instrument_type, "description": description, "yesterday_price": yesterday, "close_price": close, "last_price": last, "last_pct": last_pct, "buy_queue_volume": buy_volume if buy_queue else 0, "sell_queue_volume": sell_volume if sell_queue else 0, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
         except (ValueError, IndexError, ZeroDivisionError):
             continue
     return result
@@ -398,7 +471,7 @@ def build_industry_message(stocks, now, limit=None):
 
 
 def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
-    count, average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
+    count, _average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
     imbalance = buy_hmt - sell_hmt
     median_status = classify_median(median)
     imbalance_status = classify_imbalance(imbalance)
@@ -423,20 +496,16 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines.extend([
         "🏦 <b>کل بازار</b>",
         f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
-        f"میانگین: {ltr_signed(average)} | قبل: {ltr_signed(average - previous[1]) if previous else ltr_signed(0)}",
         f"تعداد سهام معامله‌شده: {count}",
         "",
     ])
     if leader_stats is not None:
         leader_average, leader_median = leader_stats
-        previous_leader_average = previous[5] if previous and len(previous) > 5 else None
         previous_leader_median = previous[6] if previous and len(previous) > 6 else None
         leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0
-        leader_average_delta = leader_average - previous_leader_average if previous_leader_average is not None else 0
         lines.extend([
             "👑 <b>لیدرها</b>",
             f"میانه: {ltr_signed(leader_median)} | قبل: {ltr_signed(leader_median_delta)}",
-            f"میانگین: {ltr_signed(leader_average)} | قبل: {ltr_signed(leader_average_delta)}",
             "",
         ])
     buy_delta = buy_hmt - previous[3] if previous else 0
@@ -635,6 +704,63 @@ def seconds_until_next_minute(now):
     return max(0.1, 60 - now.second - now.microsecond / 1_000_000)
 
 
+def should_save_snapshot(now):
+    """Persist historical data on ten-minute boundaries."""
+    return now.minute % 10 == 0
+
+
+def save_detailed_snapshot(stocks, now, raw_stocks=None, raw_depth=None):
+    """Save stock, group, industry and compressed raw snapshots, then prune at 31 days."""
+    timestamp = now.isoformat()
+    trading_date = now.date().isoformat()
+    eligible = [s for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
+    stock_rows = [(timestamp, trading_date, s.get("symbol"), s.get("instrument"), s.get("industry"), s.get("instrument_type"), s.get("yesterday_price"), s.get("close_price"), s.get("last_price"), s.get("last_pct"), s.get("trade_volume"), s.get("trade_value_toman"), s.get("buy_queue_volume", 0), s.get("sell_queue_volume", 0), s.get("buy_queue_value_toman", 0), s.get("sell_queue_value_toman", 0), s.get("score"), 1) for s in eligible]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany("INSERT OR REPLACE INTO stock_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", stock_rows)
+        groups = {"کل بازار": eligible, "لیدرها": [s for s in eligible if s.get("symbol") in LEADERS], "اهرمی‌ها": [s for s in eligible if s.get("symbol") in LEVERAGED_FUNDS]}
+        for name, group in groups.items():
+            scores = [float(s["score"]) for s in group]
+            turnover = sum(float(s.get("trade_value_toman", 0)) for s in group)
+            buy = sum(float(s.get("buy_queue_value_toman", 0)) for s in group) / 1e12
+            sell = sum(float(s.get("sell_queue_value_toman", 0)) for s in group) / 1e12
+            conn.execute("INSERT OR REPLACE INTO group_snapshots VALUES (?,?,?,?,?,?,?,?,?)", (timestamp, name, len(scores), statistics.mean(scores) if scores else 0, statistics.median(scores) if scores else 0, turnover, buy, sell, buy-sell))
+        industry_groups = defaultdict(list)
+        for s in eligible:
+            if s.get("industry"):
+                industry_groups[s["industry"]].append(s)
+        for industry, group in industry_groups.items():
+            scores = [float(s["score"]) for s in group]
+            turnover = sum(float(s.get("trade_value_toman", 0)) for s in group)
+            buy = sum(float(s.get("buy_queue_value_toman", 0)) for s in group) / 1e12
+            sell = sum(float(s.get("sell_queue_value_toman", 0)) for s in group) / 1e12
+            conn.execute("INSERT OR REPLACE INTO industry_detail_snapshots VALUES (?,?,?,?,?,?,?,?,?)", (timestamp, industry, len(scores), statistics.mean(scores), statistics.median(scores), turnover, buy, sell, buy-sell))
+        cutoff = (now - timedelta(days=31)).isoformat()
+        for table in ("stock_snapshots", "group_snapshots", "industry_detail_snapshots", "raw_tse_snapshots"):
+            conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+        conn.execute("DELETE FROM daily_stock_summary WHERE trading_date < ?", ((now - timedelta(days=31)).date().isoformat(),))
+        conn.execute("DELETE FROM daily_market_summary WHERE trading_date < ?", ((now - timedelta(days=31)).date().isoformat(),))
+        rows = conn.execute("SELECT trading_date, symbol, MAX(industry), COUNT(*), MAX(trade_volume), MAX(trade_value_toman), AVG(score), MIN(score), MAX(score), MAX(buy_queue_value_toman), MAX(sell_queue_value_toman) FROM stock_snapshots WHERE trading_date = ? GROUP BY trading_date, symbol", (trading_date,)).fetchall()
+        conn.executemany("INSERT OR REPLACE INTO daily_stock_summary(trading_date,symbol,industry,snapshot_count,final_volume,final_turnover_toman,average_score,median_score,min_score,max_score,last_score,max_buy_queue_toman,max_sell_queue_toman) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [(r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[6],r[7],r[8],r[8],r[9],r[10]) for r in rows])
+        latest = conn.execute("SELECT score, trade_value_toman, buy_queue_value_toman, sell_queue_value_toman FROM stock_snapshots WHERE trading_date = ? AND timestamp = (SELECT MAX(timestamp) FROM stock_snapshots WHERE trading_date = ?)", (trading_date,trading_date)).fetchall()
+        if latest:
+            scores=[r[0] for r in latest]; buy=sum(r[2] for r in latest)/1e12; sell=sum(r[3] for r in latest)/1e12
+            snapshot_count = conn.execute("SELECT COUNT(DISTINCT timestamp) FROM stock_snapshots WHERE trading_date = ?", (trading_date,)).fetchone()[0]
+            conn.execute("INSERT OR REPLACE INTO daily_market_summary VALUES (?,?,?,?,?,?,?,?,?,?,?)", (trading_date, snapshot_count, len(latest), sum(scores)/len(scores), statistics.median(scores), sum(r[1] for r in latest), buy, sell, buy-sell, buy-sell, None))
+    if raw_stocks is not None and raw_depth is not None:
+        raw_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "raw_tse")
+        os.makedirs(raw_dir, exist_ok=True)
+        stamp = now.strftime("%Y%m%dT%H%M%S")
+        paths = []
+        for label, payload in (("stocks", raw_stocks), ("depth", raw_depth)):
+            path = os.path.join(raw_dir, f"{stamp}_{label}.json.gz")
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            with gzip.open(path, "wb", compresslevel=6) as fh: fh.write(data)
+            paths.append((path, len(data), hashlib.sha256(data).hexdigest()))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO raw_tse_snapshots VALUES (?,?,?,?,?,?,?,?)", (timestamp, trading_date, paths[0][0], paths[1][0], paths[0][1], paths[1][1], paths[0][2], paths[1][2]))
+
+
+
 def create_market_charts(now, chart_dir):
     from PIL import Image, ImageDraw, ImageFont
     try:
@@ -664,7 +790,7 @@ def create_market_charts(now, chart_dir):
                 continue
         return ImageFont.load_default()
     colors = ["#1565c0", "#d84315", "#2e7d32", "#8e24aa"]
-    labels = ["میانه کل بازار", "میانگین کل بازار", "میانه لیدرها", "میانگین لیدرها"]
+    labels = ["میانه کل بازار", "میانه لیدرها"]
     times = [r[0] for r in rows]
     def render(title, series, legend, path, ylabel):
         width, height = 2200, 1250; left, right, top, bottom = 150, 430, 120, 180
@@ -691,12 +817,10 @@ def create_market_charts(now, chart_dir):
     # Columns are: timestamp, market average, market median,
     # leader average, leader median, buy queue, sell queue.
     score_path = render(
-        "#وضعیت بازار - روند نمره",
+        "#وضعیت بازار - روند میانه نمره",
         [
             [r[2] for r in rows],
-            [r[1] for r in rows],
             [r[4] for r in rows],
-            [r[3] for r in rows],
         ],
         labels,
         os.path.join(chart_dir, "market_scores.png"),
@@ -731,21 +855,32 @@ def run_pipeline(session=None, now=None):
         logging.warning("No configured symbols found in TSETMC data")
         return 0
     init_db()
-    save_scores(data, now)
-    attach_industries(data, session)
-    industry_values = {item["industry"]: item["median"] for item in industry_stats(data)}
-    industry_message = build_industry_message(data, now, limit=5)
-    save_industry_snapshot(industry_values, now)
+    persist_snapshot = should_save_snapshot(now)
+    if persist_snapshot:
+        save_scores(data, now)
+
+    # Group reports must not wait for the optional/slow industry lookup.
+    # A TSE sector API/cache failure should not suppress #اهرمی and #لیدر.
     market_values = market_summary_values(data)
     market_previous = previous_market_snapshot(now)
     leader_average, leader_median = market_group_average_median(leaders)
     turnover = update_daily_turnover(data, now)
-    save_market_snapshot(market_values, now, leader_average, leader_median)
+    if persist_snapshot:
+        save_market_snapshot(market_values, now, leader_average, leader_median)
     if send_market_report:
         send_telegram(market_summary(data, market_previous, (leader_average, leader_median), turnover), session)
     if send_detailed_reports:
         send_telegram(build_group_message("#اهرمی", leveraged, now), session)
         send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
+
+    # Industry enrichment is optional and must happen after the group reports.
+    attach_industries(data, session)
+    industry_values = {item["industry"]: item["median"] for item in industry_stats(data)}
+    industry_message = build_industry_message(data, now, limit=5)
+    if persist_snapshot:
+        save_industry_snapshot(industry_values, now)
+        save_detailed_snapshot(data, now, stocks_raw, depth_raw)
+    if send_detailed_reports:
         send_telegram(industry_message, session)
     if send_detailed_reports:
         chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
@@ -757,7 +892,7 @@ def run_pipeline(session=None, now=None):
         if leaders_chart:
             send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۱۰ لیدر برتر", session)
         market_charts = create_market_charts(now, chart_dir)
-        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۴ روند نمره",)):
+        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۲ روند میانه نمره",)):
             send_telegram_photo(chart, caption, session)
     return len(data)
 

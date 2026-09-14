@@ -1,3 +1,5 @@
+import gzip
+import json
 import os
 import sqlite3
 
@@ -22,9 +24,9 @@ def test_market_summary_puts_three_status_scores_at_top():
     ]
     report = market_summary(stocks, leader_stats=(0.0, 0.0), turnover=(10.0, 1.3, "خوب"))
     top = report.splitlines()[:6]
-    assert top[2] == "⭐ میانه بازار: ⭐⭐⭐⭐⭐"
-    assert top[3] == "⭐ اختلاف عرضه و تقاضا: ⭐⭐⭐⭐"
-    assert top[4] == "⭐ نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
+    assert top[2] == "📈 نمره میانه: ⭐⭐⭐⭐⭐"
+    assert top[3] == "⚖️ سربار تقاضا خالص: ⭐⭐⭐⭐"
+    assert top[4] == "💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
 
 
 def test_market_allocation_signal_classifies_median_gap():
@@ -70,14 +72,14 @@ def test_market_summary_reports_count_average_and_median_for_traded_stocks():
     ]
     report = market_summary(stocks)
     assert "تعداد سهام معامله‌شده: 3" in report
-    assert "میانگین: ‎2.7‎" in report
+    assert "میانگین:" not in report
     assert "میانه: ‎2.0‎" in report
 
 
 def test_market_summary_is_empty_when_no_stock_traded():
     report = market_summary([{ "symbol": "الف", "score": 1.0, "trade_volume": 0, "eligible_market_stock": True }])
     assert "تعداد سهام معامله‌شده: 0" in report
-    assert "میانگین: ‎0.0‎" in report
+    assert "میانگین:" not in report
     assert "میانه: ‎0.0‎" in report
 
 
@@ -147,3 +149,49 @@ def test_industry_report_ranks_only_configured_industries_by_median_and_previous
 def test_industry_report_excludes_unconfigured_industries():
     stocks = [{"symbol": "الف", "score": 10, "trade_volume": 1, "eligible_market_stock": True, "industry": "رایانه"}]
     assert main.industry_stats(stocks) == []
+
+
+def test_detailed_snapshot_creates_tables_and_gzip_raw(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "history.db"))
+    main.init_db()
+    now = main.datetime(2026, 9, 14, 10, 0, tzinfo=main.TEHRAN)
+    stocks = [{"symbol": "الف", "instrument": "1", "industry": "بانک", "instrument_type": "N1",
+               "yesterday_price": 10, "close_price": 11, "last_price": 11, "last_pct": 10,
+               "trade_volume": 100, "trade_value_toman": 1000, "buy_queue_volume": 5,
+               "sell_queue_volume": 0, "buy_queue_value_toman": 50, "sell_queue_value_toman": 0,
+               "score": 1.2, "eligible_market_stock": True}]
+    main.save_detailed_snapshot(stocks, now, ["stock"], ["depth"])
+    with sqlite3.connect(main.DB_PATH) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"stock_snapshots", "group_snapshots", "industry_detail_snapshots", "raw_tse_snapshots"} <= tables
+        assert conn.execute("SELECT COUNT(*) FROM stock_snapshots").fetchone()[0] == 1
+        raw = conn.execute("SELECT stocks_path FROM raw_tse_snapshots").fetchone()[0]
+    with gzip.open(raw, "rt", encoding="utf-8") as fh:
+        assert json.load(fh) == ["stock"]
+
+
+def test_run_pipeline_sends_group_reports_before_industry_lookup_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "history.db"))
+    monkeypatch.setattr(main, "fetch_market_data", lambda session=None: ([], []))
+    stocks = [
+        {"symbol": "اهرم", "score": 2.0},
+        {"symbol": "فولاد", "score": 3.0},
+    ]
+    monkeypatch.setattr(main, "parse_market_data", lambda stocks_raw, depth_raw: stocks)
+    monkeypatch.setattr(main, "attach_industries", lambda data, session=None: (_ for _ in ()).throw(RuntimeError("sector API down")))
+    sent = []
+    monkeypatch.setattr(main, "send_telegram", lambda text, session=None: sent.append(text))
+    monkeypatch.setattr(main, "should_send_market_report", lambda now: False)
+    monkeypatch.setattr(main, "should_send_market_chart", lambda now: True)
+    monkeypatch.setattr(main, "create_score_chart", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "create_market_charts", lambda *args, **kwargs: [])
+    now = main.datetime(2026, 9, 14, 10, 0, tzinfo=main.TEHRAN)
+
+    try:
+        main.run_pipeline(now=now)
+    except RuntimeError as exc:
+        assert str(exc) == "sector API down"
+
+    assert len(sent) == 2
+    assert sent[0].startswith("<b>#اهرمی</b>")
+    assert sent[1].startswith("<b>#لیدر</b>")
