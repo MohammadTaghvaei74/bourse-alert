@@ -780,6 +780,21 @@ def save_detailed_snapshot(stocks, now, raw_stocks=None, raw_depth=None):
             scores=[r[0] for r in latest]; buy=sum(r[2] for r in latest)/1e12; sell=sum(r[3] for r in latest)/1e12
             snapshot_count = conn.execute("SELECT COUNT(DISTINCT timestamp) FROM stock_snapshots WHERE trading_date = ?", (trading_date,)).fetchone()[0]
             conn.execute("INSERT OR REPLACE INTO daily_market_summary VALUES (?,?,?,?,?,?,?,?,?,?,?)", (trading_date, snapshot_count, len(latest), sum(scores)/len(scores), statistics.median(scores), sum(r[1] for r in latest), buy, sell, buy-sell, buy-sell, None))
+    raw_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "raw_tse")
+    cutoff_date = (now - timedelta(days=31)).date()
+    if os.path.isdir(raw_dir):
+        for filename in os.listdir(raw_dir):
+            if not filename.endswith(".json.gz"):
+                continue
+            try:
+                file_date = datetime.strptime(filename[:15], "%Y%m%dT%H%M%S").date()
+            except ValueError:
+                continue
+            if file_date < cutoff_date:
+                try:
+                    os.remove(os.path.join(raw_dir, filename))
+                except OSError:
+                    logging.warning("Could not remove expired raw file: %s", filename)
     if raw_stocks is not None and raw_depth is not None:
         raw_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "raw_tse")
         os.makedirs(raw_dir, exist_ok=True)
