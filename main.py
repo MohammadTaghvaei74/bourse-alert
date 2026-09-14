@@ -432,8 +432,12 @@ def attach_industries(stocks, session=None):
                 changed = True
             except (OSError, ValueError, requests.RequestException):
                 continue
-        stock["industry"] = cache.get(code)
-        stock["industry_raw"] = cache.get(f"{code}:raw") or stock.get("industry")
+        raw_industry = cache.get(code)
+        stock["industry_raw"] = cache.get(f"{code}:raw") or raw_industry
+        stock["industry"] = normalize_industry(raw_industry)
+        if stock["industry"] != raw_industry:
+            cache[code] = stock["industry"]
+            changed = True
     if changed:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as fh:
