@@ -611,13 +611,23 @@ def _snapshot_points(now):
     return rows
 
 
+def should_send_market_report(now):
+    """Send the market-status text every two minutes from 09:00."""
+    return (
+        now.minute % 2 == 0
+        and now >= now.replace(hour=9, minute=0, second=0, microsecond=0)
+        and now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
+    )
+
+
 def should_send_market_chart(now):
-    """Return True only on a ten-minute boundary during the report window."""
+    """Keep charts and detailed reports on the ten-minute schedule."""
     return (
         now.minute % 10 == 0
         and now >= now.replace(hour=9, minute=30, second=0, microsecond=0)
         and now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
     )
+
 
 
 def seconds_until_next_minute(now):
@@ -710,7 +720,8 @@ def send_telegram_photo(filename, caption, session=None):
 
 def run_pipeline(session=None, now=None):
     now = now or datetime.now(TEHRAN)
-    send_reports = should_send_market_chart(now)
+    send_market_report = should_send_market_report(now)
+    send_detailed_reports = should_send_market_chart(now)
     stocks_raw, depth_raw = fetch_market_data(session)
     data = parse_market_data(stocks_raw, depth_raw)
     stock_dict = {s["symbol"]: s for s in data}
@@ -730,12 +741,13 @@ def run_pipeline(session=None, now=None):
     leader_average, leader_median = market_group_average_median(leaders)
     turnover = update_daily_turnover(data, now)
     save_market_snapshot(market_values, now, leader_average, leader_median)
-    if send_reports:
+    if send_market_report:
         send_telegram(market_summary(data, market_previous, (leader_average, leader_median), turnover), session)
+    if send_detailed_reports:
         send_telegram(build_group_message("#اهرمی", leveraged, now), session)
         send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
         send_telegram(industry_message, session)
-    if send_reports:
+    if send_detailed_reports:
         chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
         os.makedirs(chart_dir, exist_ok=True)
         leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
