@@ -382,7 +382,12 @@ INDUSTRY_NAMES = {
 
 
 def normalize_industry(name):
-    return INDUSTRY_NAMES.get(str(name or "").replace("ي", "ی").replace("ك", "ک").strip())
+    normalized = str(name or "").replace("ي", "ی").replace("ك", "ک").strip()
+    return INDUSTRY_NAMES.get(normalized, normalized or None)
+
+
+def instrument_type_label(code):
+    return {"N1": "سهام بازار بورس", "N2": "فرابورس - بازار پایه"}.get(code, code)
 
 
 def attach_industries(stocks, session=None):
@@ -401,7 +406,7 @@ def attach_industries(stocks, session=None):
         code = stock.get("instrument")
         if not code:
             continue
-        if code not in cache:
+        if code not in cache or not cache.get(code):
             try:
                 payload = client.get(f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{code}", timeout=10).json()
                 sector = payload.get("instrumentInfo", {}).get("sector", {}).get("lSecVal")
@@ -410,6 +415,7 @@ def attach_industries(stocks, session=None):
             except (OSError, ValueError, requests.RequestException):
                 continue
         stock["industry"] = cache.get(code)
+        stock["industry_raw"] = cache.get(f"{code}:raw") or stock.get("industry")
     if changed:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as fh:
@@ -720,7 +726,7 @@ def save_detailed_snapshot(stocks, now, raw_stocks=None, raw_depth=None):
     timestamp = now.isoformat()
     trading_date = now.date().isoformat()
     eligible = [s for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
-    stock_rows = [(timestamp, trading_date, s.get("symbol"), s.get("instrument"), s.get("industry"), s.get("instrument_type"), s.get("yesterday_price"), s.get("close_price"), s.get("last_price"), s.get("last_pct"), s.get("trade_volume"), s.get("trade_value_toman"), s.get("buy_queue_volume", 0), s.get("sell_queue_volume", 0), s.get("buy_queue_value_toman", 0), s.get("sell_queue_value_toman", 0), s.get("score"), 1) for s in eligible]
+    stock_rows = [(timestamp, trading_date, s.get("symbol"), s.get("instrument"), s.get("industry"), instrument_type_label(s.get("instrument_type")), s.get("yesterday_price"), s.get("close_price"), s.get("last_price"), s.get("last_pct"), s.get("trade_volume"), s.get("trade_value_toman"), s.get("buy_queue_volume", 0), s.get("sell_queue_volume", 0), s.get("buy_queue_value_toman", 0), s.get("sell_queue_value_toman", 0), s.get("score"), 1) for s in eligible]
     with sqlite3.connect(DB_PATH) as conn:
         conn.executemany("INSERT OR REPLACE INTO stock_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", stock_rows)
         groups = {"کل بازار": eligible, "لیدرها": [s for s in eligible if s.get("symbol") in LEADERS], "اهرمی‌ها": [s for s in eligible if s.get("symbol") in LEVERAGED_FUNDS]}
