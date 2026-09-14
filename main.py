@@ -340,14 +340,22 @@ def classify_turnover_ratio(value):
 
 
 def status_stars(status):
-    """Convert the five-level status labels to a compact visual score."""
-    return {
-        "عالی": "⭐⭐⭐⭐⭐",
-        "خوب": "⭐⭐⭐⭐",
-        "معمولی": "⭐⭐⭐",
-        "بد": "⭐⭐",
-        "افتضاح": "⭐",
-    }.get(status, "—")
+    """Render every indicator on a fixed five-star scale."""
+    filled = {
+        "عالی": 5,
+        "خوب": 4,
+        "معمولی": 3,
+        "بد": 2,
+        "افتضاح": 1,
+    }.get(status, 0)
+    if not status in {"عالی", "خوب", "معمولی", "بد", "افتضاح"}:
+        return "—"
+    return "⭐" * filled + "☆" * (5 - filled)
+
+
+def turnover_ratio_text(ratio):
+    """Format the 3-day/10-day turnover ratio for the report footer."""
+    return f"‎{float(ratio):.2f}‎" if ratio is not None else "داده کافی نیست"
 
 
 def update_daily_turnover(stocks, now):
@@ -513,18 +521,20 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
     lines = [
         "📊 <b>#وضعیت_بازار</b>",
         "",
-        f"📈 نمره میانه: {status_stars(median_status)}",
-        f"⚖️ سربار تقاضا خالص: {status_stars(imbalance_status)}",
-        f"💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: {status_stars(ratio_status)}",
+        f"امتیاز کل بازار: {status_stars(median_status)}",
+        f"تقاضا: {status_stars(imbalance_status)}",
+        f"ارزش معاملات: {status_stars(ratio_status)}",
         "",
     ]
     if leader_stats is not None:
         leader_average, leader_median = leader_stats
-        allocation_gap = median - leader_median
-        allocation_signal = market_allocation_signal(median, leader_median)
+        gap = median - leader_median
+        # Map the market-vs-leaders gap onto the same five-position visual scale.
+        position = max(0, min(14, 7 + round(gap * 3)))
+        allocation_slider = "👑 " + "─" * position + "●" + "─" * (14 - position) + " 🏘️"
         lines.extend([
-            f"📍 اختلاف میانه کل بازار و لیدرها: {ltr_signed(allocation_gap)}",
-            f"🧭 تمایل پول: {allocation_signal}",
+            "تمایل پول:",
+            allocation_slider,
             "",
         ])
     lines.extend([
@@ -554,8 +564,8 @@ def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
         ratio_text = f"{turnover_ratio:.2f}" if turnover_ratio is not None else "داده کافی نیست"
         lines.extend([
             "",
-            "💧 <b>ارزش معاملات</b>",
-            f"امروز: {turnover_hmt:.0f} همت | نسبت ۳/۱۰روزه: {ratio_text}",
+            f"💧 معاملات امروز: {turnover_hmt:.0f} همت",
+            f"نسبت میانگین معاملات ۳ به ۱۰ روز: {turnover_ratio_text(turnover_ratio)}",
         ])
     return "\n".join(lines)
 
@@ -590,6 +600,16 @@ def build_group_message(title, stocks, now, limit=None):
     return "\n".join(lines)
 
 
+def top_leaders_for_chart(leaders, limit=5):
+    """Return the leaders with the highest current scores for the trend chart."""
+    return sorted(leaders, key=lambda stock: float(stock["score"]), reverse=True)[:limit]
+
+
+def top_leveraged_for_chart(leveraged, limit=3):
+    """Return the leveraged funds with the highest current scores for the trend chart."""
+    return sorted(leveraged, key=lambda stock: float(stock["score"]), reverse=True)[:limit]
+
+
 def send_telegram(text, session=None):
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
@@ -616,7 +636,7 @@ def _chart_points(symbols, now):
     return [(timestamp, values) for timestamp, values in sorted(points.items())]
 
 
-def create_score_chart(title, stocks, now, filename):
+def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
     """Create a sharp PNG with a broken Y-axis when an outlier compresses the data."""
     from PIL import Image, ImageDraw, ImageFont
     symbols = [s["symbol"] for s in stocks]
@@ -636,7 +656,7 @@ def create_score_chart(title, stocks, now, filename):
     iqr = max(q3 - q1, 1.0)
     outlier = max(values) > q3 + 1.5 * iqr and max(values) - min(values) > 8
     lo = min(values); hi = max(values)
-    if outlier:
+    if outlier and use_broken_axis:
         lower_hi = min(hi - 1, q3 + 0.75 * iqr)
         panels = [(top + 35, 610, lo, lower_hi), (700, 1050, lower_hi, hi)]
     else:
@@ -661,7 +681,7 @@ def create_score_chart(title, stocks, now, filename):
             draw.text((left - 18, y), f"{value:.1f}", fill="#333333", font=font(24), anchor="rm")
         draw.line((left, y0, left, y1), fill="#333333", width=4)
         draw.line((left, y1, left + plot_w, y1), fill="#333333", width=4)
-    if outlier:
+    if outlier and use_broken_axis:
         mid = 655
         draw.line((left - 12, mid - 12, left + 12, mid + 12), fill="#333333", width=4)
         draw.line((left - 12, mid + 12, left + 12, mid + 36), fill="#333333", width=4)
@@ -701,10 +721,35 @@ def create_score_chart(title, stocks, now, filename):
     y = legend_y + len(symbols) * 52
     draw.line((width - right + 20, y, width - right + 85, y), fill="#000000", width=10)
     draw.text((width - right + 105, y), "میانگین", fill="#111111", font=font(27), anchor="lm")
-    if outlier:
+    if outlier and use_broken_axis:
         draw.text((left + 20, 665), "مقیاس شکسته برای نمایش بهتر نقاط پرت", fill="#555555", font=font(22))
     img.save(filename, "PNG", optimize=True)
     return filename
+
+
+def create_combined_score_chart(leaders, leveraged, now, filename):
+    """Create one normal-scale image with leader and leveraged panels."""
+    from PIL import Image
+    chart_dir = os.path.dirname(filename) or "."
+    leader_path = os.path.join(chart_dir, "._leaders_panel.png")
+    leveraged_path = os.path.join(chart_dir, "._leveraged_panel.png")
+    try:
+        if not create_score_chart("#لیدر - روند نمره ۵ لیدر اصلی", leaders, now, leader_path, use_broken_axis=False):
+            return None
+        if not create_score_chart("#اهرمی - روند نمره ۳ اهرمی اصلی", leveraged, now, leveraged_path, use_broken_axis=False):
+            return None
+        with Image.open(leader_path) as top, Image.open(leveraged_path) as bottom:
+            combined = Image.new("RGB", (max(top.width, bottom.width), top.height + bottom.height), "white")
+            combined.paste(top.convert("RGB"), (0, 0))
+            combined.paste(bottom.convert("RGB"), (0, top.height))
+            combined.save(filename, "PNG", optimize=True)
+        return filename
+    finally:
+        for path in (leader_path, leveraged_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def _snapshot_points(now):
@@ -724,11 +769,11 @@ def should_send_market_report(now):
 
 
 def should_send_market_chart(now):
-    """Keep charts and detailed reports on the ten-minute schedule."""
+    """Send charts and detailed reports every ten minutes from 09:15 through 12:25."""
     return (
-        now.minute % 10 == 0
-        and now >= now.replace(hour=9, minute=30, second=0, microsecond=0)
-        and now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
+        (now.hour * 60 + now.minute - (9 * 60 + 15)) % 10 == 0
+        and now >= now.replace(hour=9, minute=15, second=0, microsecond=0)
+        and now <= now.replace(hour=12, minute=25, second=59, microsecond=0)
     )
 
 
@@ -934,21 +979,21 @@ def run_pipeline(session=None, now=None):
     if send_detailed_reports:
         chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
         os.makedirs(chart_dir, exist_ok=True)
-        leveraged_chart = create_score_chart("#اهرمی - روند نمره روزانه", leveraged, now, os.path.join(chart_dir, "leveraged.png"))
-        leaders_chart = create_score_chart("#لیدر - روند نمره ۱۰ لیدر برتر", leaders[:10], now, os.path.join(chart_dir, "leaders.png"))
-        if leveraged_chart:
-            send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
-        if leaders_chart:
-            send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره ۱۰ لیدر برتر", session)
+        chart_leveraged = top_leveraged_for_chart(leveraged)
+        chart_leaders = top_leaders_for_chart(leaders)
+        combined_chart = create_combined_score_chart(chart_leaders, chart_leveraged, now, os.path.join(chart_dir, "combined_scores.png"))
+        if combined_chart:
+            send_telegram_photo(combined_chart, "#اهرمی - نمودار روند نمره", session)
         market_charts = create_market_charts(now, chart_dir)
         for chart, caption in zip(market_charts, ("#وضعیت بازار - ۲ روند میانه نمره",)):
             send_telegram_photo(chart, caption, session)
+
     return len(data)
 
 
 def is_market_open(now=None):
     now = now or datetime.now(TEHRAN)
-    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=0, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=35, second=0, microsecond=0)
+    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=0, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
 
 
 def main():

@@ -8,13 +8,28 @@ from main import calculate_score, queue_value_billion_toman, format_report_line,
 
 
 
-def test_status_stars_map_five_levels_and_missing_data():
+def test_status_stars_uses_filled_and_hollow_five_star_scale():
     assert status_stars("عالی") == "⭐⭐⭐⭐⭐"
-    assert status_stars("خوب") == "⭐⭐⭐⭐"
-    assert status_stars("معمولی") == "⭐⭐⭐"
-    assert status_stars("بد") == "⭐⭐"
-    assert status_stars("افتضاح") == "⭐"
+    assert status_stars("خوب") == "⭐⭐⭐⭐☆"
+    assert status_stars("معمولی") == "⭐⭐⭐☆☆"
+    assert status_stars("بد") == "⭐⭐☆☆☆"
+    assert status_stars("افتضاح") == "⭐☆☆☆☆"
     assert status_stars("داده کافی نیست") == "—"
+
+
+def test_market_summary_uses_compact_labels_and_puts_turnover_ratio_at_bottom():
+    stocks = [{"symbol": "الف", "score": 3.0, "trade_volume": 100,
+               "eligible_market_stock": True,
+               "buy_queue_value_toman": 6_000_000_000_000,
+               "sell_queue_value_toman": 0}]
+    report = market_summary(stocks, turnover=(10.0, 1.3, "خوب"))
+    assert report.splitlines()[2] == "امتیاز کل بازار: ⭐⭐⭐⭐⭐"
+    assert report.splitlines()[3] == "تقاضا: ⭐⭐⭐⭐☆"
+    assert report.splitlines()[4] == "ارزش معاملات: ⭐⭐⭐⭐☆"
+    assert report.endswith("نسبت میانگین معاملات ۳ به ۱۰ روز: ‎1.30‎")
+    assert "نسبت ۳/۱۰روزه" not in report
+    assert "نمره میانه:" not in report
+    assert "سربار تقاضا خالص:" not in report
 
 
 def test_market_summary_puts_three_status_scores_at_top():
@@ -24,9 +39,9 @@ def test_market_summary_puts_three_status_scores_at_top():
     ]
     report = market_summary(stocks, leader_stats=(0.0, 0.0), turnover=(10.0, 1.3, "خوب"))
     top = report.splitlines()[:6]
-    assert top[2] == "📈 نمره میانه: ⭐⭐⭐⭐⭐"
-    assert top[3] == "⚖️ سربار تقاضا خالص: ⭐⭐⭐⭐"
-    assert top[4] == "💧 نسبت ارزش معاملات ۳ به ۱۰ روزه: ⭐⭐⭐⭐"
+    assert top[2] == "امتیاز کل بازار: ⭐⭐⭐⭐⭐"
+    assert top[3] == "تقاضا: ⭐⭐⭐⭐☆"
+    assert top[4] == "ارزش معاملات: ⭐⭐⭐⭐☆"
 
 
 def test_market_allocation_signal_classifies_median_gap():
@@ -39,14 +54,18 @@ def test_market_allocation_signal_classifies_median_gap():
     assert market_allocation_signal(0.0, 1.1) == "تمایل شدید به لیدرها"
 
 
-def test_market_summary_reports_allocation_gap_and_signal():
+def test_market_summary_reports_visual_allocation_slider_without_gap_text():
     stocks = [
         {"symbol": "الف", "score": 1.0, "trade_volume": 100, "eligible_market_stock": True},
         {"symbol": "ب", "score": 5.0, "trade_volume": 100, "eligible_market_stock": True},
     ]
     report = market_summary(stocks, leader_stats=(0.0, 1.0))
-    assert "اختلاف میانه کل بازار و لیدرها: ‎2.0‎" in report
-    assert "تمایل پول: تمایل شدید به سهام هم‌وزن" in report
+    assert "تمایل پول:\n👑 " in report
+    assert "🏘️" in report
+    assert "👑 " in report and " 🏘️" in report
+    assert "👑 " + "─" * 14 + "●" not in report
+    assert "●" in report
+    assert "اختلاف میانه کل بازار و لیدرها" not in report
 
 
 def test_market_summary_reports_market_and_leader_medians_and_signal():
@@ -57,8 +76,8 @@ def test_market_summary_reports_market_and_leader_medians_and_signal():
     report = market_summary(stocks, leader_stats=(0.0, 1.0))
     assert "میانه: ‎3.0‎" in report
     assert "میانه: ‎1.0‎" in report
-    assert "اختلاف میانه کل بازار و لیدرها: ‎2.0‎" in report
-    assert "تمایل شدید به سهام هم‌وزن" in report
+    assert "تمایل پول:" in report
+    assert "👑 " in report and "⚖️" in report
 
 
 
@@ -104,6 +123,44 @@ def test_line_shows_latin_unit_and_left_to_right_signs():
     assert format_report_line(2, {"symbol": "خودرو", "score": -4.2, "queue_value": 87, "queue_side": "sell"}) == "2. خودرو | ‎-4.2‎ | ‎-87 B‎ | قبل ‎0.0‎"
 
 
+def test_leader_chart_uses_five_highest_current_scores():
+    leaders = [
+        {"symbol": f"لیدر{i}", "score": score}
+        for i, score in enumerate((3, 10, 1, 8, 6, 9, 2), 1)
+    ]
+
+    selected = main.top_leaders_for_chart(leaders)
+
+    assert [stock["symbol"] for stock in selected] == ["لیدر2", "لیدر6", "لیدر4", "لیدر5", "لیدر1"]
+
+
+def test_leveraged_chart_uses_three_highest_current_scores():
+    leveraged = [
+        {"symbol": f"اهرمی{i}", "score": score}
+        for i, score in enumerate((3, 10, 1, 8, 6, 9, 2), 1)
+    ]
+
+    selected = main.top_leveraged_for_chart(leveraged)
+
+    assert [stock["symbol"] for stock in selected] == ["اهرمی2", "اهرمی6", "اهرمی4"]
+
+
+def test_combined_chart_has_leaders_above_leveraged_and_no_broken_axis(tmp_path, monkeypatch):
+    points = [
+        ("2026-09-14T09:15:00+03:30", {"لیدر۱": 2.0, "اهرمی۱": 1.0}),
+        ("2026-09-14T09:25:00+03:30", {"لیدر۱": 3.0, "اهرمی۱": 2.0}),
+    ]
+    monkeypatch.setattr(main, "_chart_points", lambda symbols, now: points)
+    leaders = [{"symbol": "لیدر۱", "score": 3.0}]
+    leveraged = [{"symbol": "اهرمی۱", "score": 2.0}]
+
+    chart_path = main.create_combined_score_chart(leaders, leveraged, main.datetime(2026, 9, 14, 9, 25, tzinfo=main.TEHRAN), str(tmp_path / "combined.png"))
+
+    from PIL import Image
+    with Image.open(chart_path) as image:
+        assert image.size == (2400, 3000)
+
+
 def test_market_chart_uses_four_requested_series_and_explicit_legend(tmp_path, monkeypatch):
     db_path = tmp_path / "history.db"
     monkeypatch.setattr(main, "DB_PATH", str(db_path))
@@ -119,10 +176,20 @@ def test_market_chart_uses_four_requested_series_and_explicit_legend(tmp_path, m
     assert os.path.getsize(chart_paths[0]) > 0
 
 
-def test_should_send_market_chart_only_on_ten_minute_boundaries():
-    assert main.should_send_market_chart(main.datetime(2026, 9, 13, 10, 0, tzinfo=main.TEHRAN))
-    assert main.should_send_market_chart(main.datetime(2026, 9, 13, 10, 10, tzinfo=main.TEHRAN))
-    assert not main.should_send_market_chart(main.datetime(2026, 9, 13, 10, 7, tzinfo=main.TEHRAN))
+def test_should_send_market_chart_every_ten_minutes_from_915_to_1230():
+    assert main.should_send_market_chart(main.datetime(2026, 9, 13, 9, 15, tzinfo=main.TEHRAN))
+    assert main.should_send_market_chart(main.datetime(2026, 9, 13, 10, 25, tzinfo=main.TEHRAN))
+    assert main.should_send_market_chart(main.datetime(2026, 9, 13, 12, 25, tzinfo=main.TEHRAN))
+    assert not main.should_send_market_chart(main.datetime(2026, 9, 13, 9, 20, tzinfo=main.TEHRAN))
+    assert not main.should_send_market_chart(main.datetime(2026, 9, 13, 12, 30, tzinfo=main.TEHRAN))
+
+
+def test_market_open_window_is_weekdays_0900_through_1230_tehran():
+    assert main.is_market_open(main.datetime(2026, 9, 13, 9, 0, tzinfo=main.TEHRAN))
+    assert main.is_market_open(main.datetime(2026, 9, 13, 12, 30, 59, tzinfo=main.TEHRAN))
+    assert not main.is_market_open(main.datetime(2026, 9, 13, 12, 31, tzinfo=main.TEHRAN))
+    assert main.is_market_open(main.datetime(2026, 9, 12, 10, 0, tzinfo=main.TEHRAN))
+    assert not main.is_market_open(main.datetime(2026, 9, 11, 10, 0, tzinfo=main.TEHRAN))
 
 
 def test_industry_report_ranks_only_configured_industries_by_median_and_previous_delta(tmp_path, monkeypatch):
