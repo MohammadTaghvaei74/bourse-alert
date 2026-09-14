@@ -418,7 +418,7 @@ def attach_industries(stocks, session=None):
 
 
 def industry_stats(stocks):
-    """Return traded, configured industries with their current median score."""
+    """Return traded, configured industries with median and top stock scores."""
     grouped = defaultdict(list)
     for stock in stocks:
         industry = stock.get("industry")
@@ -427,10 +427,14 @@ def industry_stats(stocks):
             and stock.get("eligible_market_stock")
             and float(stock.get("trade_volume", 0)) > 0
         ):
-            grouped[industry].append(float(stock["score"]))
+            grouped[industry].append(stock)
     return [
-        {"industry": industry, "median": statistics.median(scores)}
-        for industry, scores in grouped.items()
+        {
+            "industry": industry,
+            "median": statistics.median(float(stock["score"]) for stock in members),
+            "top_stocks": sorted(members, key=lambda stock: float(stock["score"]), reverse=True)[:5],
+        }
+        for industry, members in grouped.items()
     ]
 
 
@@ -467,6 +471,8 @@ def build_industry_message(stocks, now, limit=None):
     for index, item in enumerate(ranked, 1):
         delta = item["median"] - float(previous.get(item["industry"], 0.0))
         lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل ‎{delta:+.1f}‎")
+        for stock_index, stock in enumerate(item["top_stocks"], 1):
+            lines.append(f"   {stock_index}) {stock['symbol']} | {ltr_signed(stock['score'])}")
     return "\n".join(lines)
 
 

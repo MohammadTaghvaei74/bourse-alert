@@ -141,9 +141,33 @@ def test_industry_report_ranks_only_configured_industries_by_median_and_previous
     assert report.splitlines() == [
         "#صنایع",
         "1. شیمیایی | ‎99.0‎ | قبل ‎+99.0‎",
+        "   1) شیمی | ‎99.0‎",
         "2. فلزات اساسی | ‎4.0‎ | قبل ‎+3.0‎",
+        "   1) فولاد | ‎5.0‎",
+        "   2) فملی | ‎3.0‎",
         "3. خودرو | ‎2.0‎ | قبل ‎-2.0‎",
+        "   1) خودرو | ‎2.0‎",
     ]
+
+
+def test_industry_report_shows_only_five_highest_scoring_stocks_per_industry(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "history.db"))
+    now = main.datetime(2026, 9, 13, 10, 10, tzinfo=main.TEHRAN)
+    stocks = [
+        {"symbol": f"سهم{i}", "score": score, "trade_volume": 10, "eligible_market_stock": True, "industry": "بانک"}
+        for i, score in enumerate((1, 6, 3, 5, 2, 4), 1)
+    ]
+
+    report = main.build_industry_message(stocks, now, limit=5)
+
+    assert report.splitlines()[2:] == [
+        "   1) سهم2 | ‎6.0‎",
+        "   2) سهم4 | ‎5.0‎",
+        "   3) سهم6 | ‎4.0‎",
+        "   4) سهم3 | ‎3.0‎",
+        "   5) سهم5 | ‎2.0‎",
+    ]
+    assert "سهم1" not in report
 
 
 def test_industry_report_excludes_unconfigured_industries():
