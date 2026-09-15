@@ -230,6 +230,28 @@ def is_derivative(symbol):
     return any(symbol.startswith(p) for p in ("ض", "ط", "ص", "هـ", "سکه")) and any(c.isdigit() for c in symbol)
 
 
+def is_common_stock(symbol, description, instrument_type):
+    """Return True only for ordinary company shares.
+
+    TSETMC's instrument_type is not a complete asset-class classifier:
+    ordinary shares can use codes such as N1, N2, Z1, P1, 1N, and others.
+    Therefore classification is based on the instrument description/symbol,
+    with explicit exclusions for funds, rights, and non-stock instruments.
+    """
+    symbol = (symbol or "").strip()
+    description = (description or "").strip()
+    normalized = description.replace("ي", "ی").replace("ك", "ک")
+    excluded_terms = (
+        "صندوق", "ص.س.", "حق تقدم", "اوراق", "اختیار", "آتی",
+        "گواهی سپرده", "تسهیلات مسکن", "اسناد خزانه",
+    )
+    if not symbol or symbol.endswith("ح") or is_derivative(symbol):
+        return False
+    if any(term in normalized for term in excluded_terms):
+        return False
+    return True
+
+
 def fetch_market_data(session=None):
     session = session or requests.Session()
     response = session.get(TSETMC_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
@@ -264,8 +286,7 @@ def parse_market_data(stocks_raw, depth_raw):
             trade_volume = _float(fields[9]); max_price = _float(fields[19]); min_price = _float(fields[20])
             instrument_type = fields[25].strip() if len(fields) > 25 else ""
             description = fields[3].replace("ي", "ی").replace("ك", "ک").strip() if len(fields) > 3 else ""
-            eligible_market_stock = (instrument_type in {"N1", "N2"} and not any(c.isdigit() for c in symbol)
-                                     and not symbol.endswith("ح") and not description.startswith("صندوق"))
+            eligible_market_stock = is_common_stock(symbol, description, instrument_type)
             if not symbol or yesterday <= 0 or is_derivative(symbol):
                 continue
             last_pct = round((last - yesterday) / yesterday * 100, 2)
@@ -500,6 +521,8 @@ def build_industry_message(stocks, now, limit=None):
     previous = {}
     for industry, median in old_rows:
         previous.setdefault(industry, median)
+    all_symbols = [stock["symbol"] for item in current for stock in item["top_stocks"]]
+    previous_stock_scores = previous_scores(all_symbols, now)
     ranked = sorted(current, key=lambda item: item["median"], reverse=True)
     if limit:
         ranked = ranked[:limit]
@@ -508,7 +531,12 @@ def build_industry_message(stocks, now, limit=None):
         delta = item["median"] - float(previous.get(item["industry"], 0.0))
         lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل ‎{delta:+.1f}‎")
         for stock_index, stock in enumerate(item["top_stocks"], 1):
-            lines.append(f"   {stock_index}) {stock['symbol']} | {ltr_signed(stock['score'])}")
+            score = float(stock["score"])
+            previous_score = previous_stock_scores.get(stock["symbol"])
+            stock_delta = score - float(previous_score) if previous_score is not None else 0.0
+            lines.append(
+                f"   {stock_index}) {stock['symbol']} | {ltr_signed(score)} | قبل {ltr_signed(stock_delta)}"
+            )
     return "\n".join(lines)
 
 
@@ -623,21 +651,33 @@ def send_telegram(text, session=None):
 
 
 def _chart_points(symbols, now):
+    """Read normal-range historical scores, excluding corrupted outliers."""
     if not symbols:
         return []
     marks = ",".join("?" for _ in symbols)
-    chart_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    query = f"SELECT symbol, score, timestamp FROM history WHERE symbol IN ({marks}) AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, symbol"
+    chart_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    # Older rows use a space separator while newer rows use ISO's ``T``.
+    # A separator-free date-time window keeps both formats in the chart.
+    start_text = chart_start.strftime("%Y-%m-%d 09:15:00")
+    end_text = now.strftime("%Y-%m-%dT%H:%M:%S")
+    query = f"""
+        SELECT symbol, score, timestamp
+        FROM history
+        WHERE symbol IN ({marks})
+          AND timestamp >= ? AND timestamp <= ?
+          AND score BETWEEN -20 AND 20
+        ORDER BY timestamp, symbol
+    """
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(query, list(symbols) + [chart_start.isoformat(), now.isoformat()]).fetchall()
+        rows = conn.execute(query, list(symbols) + [start_text, end_text]).fetchall()
     points = {}
     for symbol, score, timestamp in rows:
-        points.setdefault(timestamp, {})[symbol] = score
+        points.setdefault(timestamp, {})[symbol] = float(score)
     return [(timestamp, values) for timestamp, values in sorted(points.items())]
 
 
-def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
-    """Create a sharp PNG with a broken Y-axis when an outlier compresses the data."""
+def create_score_chart(title, stocks, now, filename, use_broken_axis=False):
+    """Create a normal-scale score trend chart."""
     from PIL import Image, ImageDraw, ImageFont
     symbols = [s["symbol"] for s in stocks]
     points = _chart_points(symbols, now)
@@ -651,16 +691,22 @@ def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
     if not values:
         return None
     values_sorted = sorted(values)
-    q1 = values_sorted[len(values_sorted) // 4]
-    q3 = values_sorted[(len(values_sorted) * 3) // 4]
-    iqr = max(q3 - q1, 1.0)
-    outlier = max(values) > q3 + 1.5 * iqr and max(values) - min(values) > 8
-    lo = min(values); hi = max(values)
-    if outlier and use_broken_axis:
-        lower_hi = min(hi - 1, q3 + 0.75 * iqr)
-        panels = [(top + 35, 610, lo, lower_hi), (700, 1050, lower_hi, hi)]
-    else:
-        panels = [(top + 35, height - bottom, lo, hi)]
+    # Use robust quantiles for the display range so one genuine extreme score
+    # (for example a leader with an unusually large queue) cannot flatten all
+    # other lines. The original values remain in the data; only their pixels
+    # are clipped to the chart edge.
+    def percentile(sorted_values, fraction):
+        position = (len(sorted_values) - 1) * fraction
+        lower = int(position)
+        upper = min(lower + 1, len(sorted_values) - 1)
+        weight = position - lower
+        return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+    lo = min(percentile(values_sorted, 0.02), 0.0)
+    hi = max(percentile(values_sorted, 0.98), 0.0)
+    padding = max((hi - lo) * 0.08, 0.5)
+    lo -= padding
+    hi += padding
+    panels = [(top + 35, height - bottom, lo, hi)]
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
     def font(size):
@@ -681,16 +727,12 @@ def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
             draw.text((left - 18, y), f"{value:.1f}", fill="#333333", font=font(24), anchor="rm")
         draw.line((left, y0, left, y1), fill="#333333", width=4)
         draw.line((left, y1, left + plot_w, y1), fill="#333333", width=4)
-    if outlier and use_broken_axis:
-        mid = 655
-        draw.line((left - 12, mid - 12, left + 12, mid + 12), fill="#333333", width=4)
-        draw.line((left - 12, mid + 12, left + 12, mid + 36), fill="#333333", width=4)
-        draw.line((left + plot_w - 12, mid - 12, left + plot_w + 12, mid + 12), fill="#333333", width=4)
-        draw.line((left + plot_w - 12, mid + 12, left + plot_w + 12, mid + 36), fill="#333333", width=4)
     def draw_series(symbol, color, panel):
         segments = []; current = []
         for i, (_, row) in enumerate(points):
-            if symbol in row and panel[2] <= row[symbol] <= panel[3]: current.append((int(x_at(i)), int(y_at(row[symbol], panel))))
+            if symbol in row:
+                clipped = min(max(row[symbol], panel[2]), panel[3])
+                current.append((int(x_at(i)), int(y_at(clipped, panel))))
             elif len(current) > 1: segments.append(current); current = []
         if len(current) > 1: segments.append(current)
         for segment in segments: draw.line(segment, fill=color, width=6, joint="curve")
@@ -698,11 +740,11 @@ def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
         for panel in panels: draw_series(symbol, colors[idx % len(colors)], panel)
     for panel in panels:
         y0, y1, low, high = panel
-        avg_points = []
+        median_points = []
         for i, (_, row) in enumerate(points):
-            vals = [row[s] for s in symbols if s in row and low <= row[s] <= high]
-            if vals: avg_points.append((int(x_at(i)), int(y_at(sum(vals) / len(vals), panel))))
-        if len(avg_points) > 1: draw.line(avg_points, fill="#000000", width=10, joint="curve")
+            vals = [min(max(row[s], low), high) for s in symbols if s in row]
+            if vals: median_points.append((int(x_at(i)), int(y_at(statistics.median(vals), panel))))
+        if len(median_points) > 1: draw.line(median_points, fill="#000000", width=10, joint="curve")
     if points:
         label_count = min(8, len(points)); step = max(1, (len(points) - 1) // (label_count - 1))
         for i in range(0, len(points), step):
@@ -720,9 +762,7 @@ def create_score_chart(title, stocks, now, filename, use_broken_axis=True):
         draw.text((width - right + 105, y), symbol, fill="#111111", font=font(27), anchor="lm")
     y = legend_y + len(symbols) * 52
     draw.line((width - right + 20, y, width - right + 85, y), fill="#000000", width=10)
-    draw.text((width - right + 105, y), "میانگین", fill="#111111", font=font(27), anchor="lm")
-    if outlier and use_broken_axis:
-        draw.text((left + 20, 665), "مقیاس شکسته برای نمایش بهتر نقاط پرت", fill="#555555", font=font(22))
+    draw.text((width - right + 105, y), "میانه", fill="#111111", font=font(27), anchor="lm")
     img.save(filename, "PNG", optimize=True)
     return filename
 
@@ -981,9 +1021,12 @@ def run_pipeline(session=None, now=None):
         os.makedirs(chart_dir, exist_ok=True)
         chart_leveraged = top_leveraged_for_chart(leveraged)
         chart_leaders = top_leaders_for_chart(leaders)
-        combined_chart = create_combined_score_chart(chart_leaders, chart_leveraged, now, os.path.join(chart_dir, "combined_scores.png"))
-        if combined_chart:
-            send_telegram_photo(combined_chart, "#اهرمی - نمودار روند نمره", session)
+        leveraged_chart = create_score_chart("#اهرمی - روند نمره ۳ اهرمی برتر", chart_leveraged, now, os.path.join(chart_dir, "leveraged.png"))
+        leaders_chart = create_score_chart("#لیدر - روند نمره ۵ لیدر برتر", chart_leaders, now, os.path.join(chart_dir, "leaders.png"))
+        if leveraged_chart:
+            send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
+        if leaders_chart:
+            send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره", session)
         market_charts = create_market_charts(now, chart_dir)
         for chart, caption in zip(market_charts, ("#وضعیت بازار - ۲ روند میانه نمره",)):
             send_telegram_photo(chart, caption, session)

@@ -8,6 +8,14 @@ from main import calculate_score, queue_value_billion_toman, format_report_line,
 
 
 
+def test_common_stock_filter_includes_non_n1_n2_shares_and_excludes_non_stocks():
+    assert main.is_common_stock("تابان", "گروه پتروشیمی تابان فردا", "1N")
+    assert main.is_common_stock("مارون", "پتروشیمی مارون", "Z1")
+    assert not main.is_common_stock("موج", "ص.س. اهرمی موج فیروزه-س", "TA")
+    assert not main.is_common_stock("تسه1405", "امتیاز تسهیلات مسکن سال1405", "M1")
+    assert not main.is_common_stock("خودروح", "حق تقدم شرکت", "N1")
+
+
 def test_status_stars_uses_filled_and_hollow_five_star_scale():
     assert status_stars("عالی") == "⭐⭐⭐⭐⭐"
     assert status_stars("خوب") == "⭐⭐⭐⭐☆"
@@ -145,20 +153,31 @@ def test_leveraged_chart_uses_three_highest_current_scores():
     assert [stock["symbol"] for stock in selected] == ["اهرمی2", "اهرمی6", "اهرمی4"]
 
 
-def test_combined_chart_has_leaders_above_leveraged_and_no_broken_axis(tmp_path, monkeypatch):
-    points = [
-        ("2026-09-14T09:15:00+03:30", {"لیدر۱": 2.0, "اهرمی۱": 1.0}),
-        ("2026-09-14T09:25:00+03:30", {"لیدر۱": 3.0, "اهرمی۱": 2.0}),
-    ]
-    monkeypatch.setattr(main, "_chart_points", lambda symbols, now: points)
-    leaders = [{"symbol": "لیدر۱", "score": 3.0}]
-    leveraged = [{"symbol": "اهرمی۱", "score": 2.0}]
+def test_chart_points_use_valid_stock_snapshots_and_drop_outliers(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "history.db"))
+    main.init_db()
+    with sqlite3.connect(main.DB_PATH) as conn:
+        conn.executemany(
+            "INSERT INTO stock_snapshots(timestamp,trading_date,symbol,score,valid) VALUES (?,?,?,?,?)",
+            [
+                ("2026-09-14T09:15:00+03:30", "2026-09-14", "اهرم", 3.2, 1),
+                ("2026-09-14T09:25:00+03:30", "2026-09-14", "اهرم", 4.1, 1),
+                ("2026-09-14T09:25:00+03:30", "2026-09-14", "جهش", 9999, 1),
+            ],
+        )
+    points = main._chart_points(["اهرم", "جهش"], main.datetime(2026, 9, 14, 9, 25, tzinfo=main.TEHRAN))
+    assert points == [("2026-09-14T09:15:00+03:30", {"اهرم": 3.2}), ("2026-09-14T09:25:00+03:30", {"اهرم": 4.1})]
 
-    chart_path = main.create_combined_score_chart(leaders, leveraged, main.datetime(2026, 9, 14, 9, 25, tzinfo=main.TEHRAN), str(tmp_path / "combined.png"))
 
+def test_score_chart_has_normal_single_axis(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "_chart_points", lambda symbols, now: [
+        ("2026-09-14T09:15:00+03:30", {symbols[0]: 2.0}),
+        ("2026-09-14T09:25:00+03:30", {symbols[0]: 4.0}),
+    ])
+    path = main.create_score_chart("#اهرمی", [{"symbol": "اهرم", "score": 4}], main.datetime(2026, 9, 14, 9, 25, tzinfo=main.TEHRAN), str(tmp_path / "chart.png"))
     from PIL import Image
-    with Image.open(chart_path) as image:
-        assert image.size == (2400, 3000)
+    with Image.open(path) as image:
+        assert image.size == (2400, 1500)
 
 
 def test_market_chart_uses_four_requested_series_and_explicit_legend(tmp_path, monkeypatch):
@@ -208,12 +227,12 @@ def test_industry_report_ranks_only_configured_industries_by_median_and_previous
     assert report.splitlines() == [
         "#صنایع",
         "1. شیمیایی | ‎99.0‎ | قبل ‎+99.0‎",
-        "   1) شیمی | ‎99.0‎",
+        "   1) شیمی | ‎99.0‎ | قبل ‎0.0‎",
         "2. فلزات اساسی | ‎4.0‎ | قبل ‎+3.0‎",
-        "   1) فولاد | ‎5.0‎",
-        "   2) فملی | ‎3.0‎",
+        "   1) فولاد | ‎5.0‎ | قبل ‎0.0‎",
+        "   2) فملی | ‎3.0‎ | قبل ‎0.0‎",
         "3. خودرو | ‎2.0‎ | قبل ‎-2.0‎",
-        "   1) خودرو | ‎2.0‎",
+        "   1) خودرو | ‎2.0‎ | قبل ‎0.0‎",
     ]
 
 
@@ -228,11 +247,11 @@ def test_industry_report_shows_only_five_highest_scoring_stocks_per_industry(tmp
     report = main.build_industry_message(stocks, now, limit=5)
 
     assert report.splitlines()[2:] == [
-        "   1) سهم2 | ‎6.0‎",
-        "   2) سهم4 | ‎5.0‎",
-        "   3) سهم6 | ‎4.0‎",
-        "   4) سهم3 | ‎3.0‎",
-        "   5) سهم5 | ‎2.0‎",
+        "   1) سهم2 | ‎6.0‎ | قبل ‎0.0‎",
+        "   2) سهم4 | ‎5.0‎ | قبل ‎0.0‎",
+        "   3) سهم6 | ‎4.0‎ | قبل ‎0.0‎",
+        "   4) سهم3 | ‎3.0‎ | قبل ‎0.0‎",
+        "   5) سهم5 | ‎2.0‎ | قبل ‎0.0‎",
     ]
     assert "سهم1" not in report
 
