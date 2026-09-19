@@ -1,3 +1,17 @@
 __pycache__/
 .env
 *.pyc
+*.db
+*.db-*
+venv/
+.venv/
+charts/
+sample-reviewed-spec/
+raw_tse/
+real_sample/
+metadata*.json
+industry_cache.json
+runtime_health.json
+release_backups/
+staging-reviewed-spec/
+preview*/

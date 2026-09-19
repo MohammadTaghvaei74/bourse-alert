@@ -1,0 +1,1 @@
+"""Bourse Alert regression tests."""

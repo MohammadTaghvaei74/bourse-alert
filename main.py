@@ -1,1078 +1,577 @@
-import gzip
-import hashlib
-import html
-import json
-import logging
-import os
-import sqlite3
-import statistics
-import time
-from collections import defaultdict
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+"""Revised Bourse reporting. Importing this module performs no I/O."""
+import math
 
-import requests
-
-DB_PATH = os.getenv("DB_PATH", "/root/bourse-alert/scores_history.db")
-TSETMC_URL = "https://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx"
-TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "https://tg-proxy.m-taghvaei74.workers.dev")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004419199993")
-TEHRAN = ZoneInfo("Asia/Tehran")
-
-LEVERAGED_FUNDS = ["اهرم", "شتاب", "موج", "جهش", "توان", "نارنج", "بیدار"]
-LEADERS = ["ذوب", "فملی", "فولاد", "تاپیکو", "شستا", "شبریز", "شتران", "وغدیر", "شپنا", "شبندر", "پالایش", "خگستر", "فارس", "خودرو", "وبصادر", "وبملت", "خساپا", "دارا یکم", "پارسان", "وتجارت"]
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-
-def calculate_score(last_pct, buy_queue_volume, sell_queue_volume, trade_volume):
-    effective_volume = max(float(trade_volume), 50_000.0)
-    return round(float(last_pct) + float(buy_queue_volume) / effective_volume - float(sell_queue_volume) / effective_volume, 2)
-
-
-def queue_value_billion_toman(price, volume):
-    # TSE prices and values are in rials; divide by 10 for tomans.
-    return int(float(price) * float(volume) / 10 / 1_000_000_000)
-
-
-def ltr_signed(value, decimals=1):
-    value = float(value)
-    sign = "-" if value < 0 else ""
-    return f"\u200e{sign}{abs(value):.{decimals}f}\u200e"
+def tick(store,now,fetcher,metadata,output_dir,sender=None,include_legacy=True):
+    """One bounded poll. Non-slot polls are health/final-turnover only."""
+    now=now.astimezone(TEHRAN); health_path=Path(store.path).parent/'runtime_health.json'
+    try:
+        packet=fetcher()
+        source_date=packet['market_date']
+        observed=datetime.fromisoformat(source_date+'T'+packet['asof']).replace(tzinfo=TEHRAN)
+        in_window=now.weekday() not in (3,4) and (9,5)<=(now.hour,now.minute)<=(12,25)
+        fresh=source_date==str(now.date()) and -60<=(now-observed).total_seconds()<=300
+        confirmed_closed=fresh and packet.get('closed') is True
+        status='fresh' if in_window and fresh and not confirmed_closed else 'closed' if confirmed_closed or not in_window else 'stale'
+        health=dict(checked_at=now.isoformat(),market_date=source_date,source_asof=observed.isoformat(),session_open=status=='fresh',status=status)
+        temp=health_path.with_suffix('.tmp'); temp.write_text(json.dumps(health),encoding='utf-8'); temp.replace(health_path)
+        logging.info('TSETMC market data fetched; market_date=%s status=%s',source_date,status)
+        slot=now.replace(second=0,microsecond=0)
+        messages=[]
+        if status=='fresh' and slot in report_slots(now.date()):
+            messages=run_cycle(store,now,lambda:packet,metadata,output_dir,sender)
+            if include_legacy:
+                try:
+                    stocks=parse_market_data(packet['stocks'],packet.get('depth'),metadata)
+                    legacy=legacy_reports(store,stocks,slot,output_dir)
+                    if sender: deliver(store,slot.isoformat(),legacy,sender)
+                except Exception: logging.exception('Legacy reports failed independently')
+        # Never derive complete daily turnover from the 12:25 snapshot. Only
+        # independently fetched post-close cumulative ordinary-share turnover.
+        if now.hour>=13 and source_date==str(now.date()) and packet['asof']>='12:30:00' and now.weekday() not in (3,4):
+            stocks=parse_market_data(packet['stocks'],[],metadata)
+            ordinary=[s for s in stocks if s['eligible_market_stock']]
+            if ordinary:
+                store.finalize_day(now.date(),sum(s['trade_value_toman'] for s in ordinary),verified=True,source='post-close MarketWatch ordinary shares; overview date verified; '+now.isoformat())
+        store.prune(now)
+        return messages
+    except Exception:
+        health_path.write_text(json.dumps(dict(checked_at=now.isoformat(),market_date=None,session_open=False,status='error')),encoding='utf-8')
+        raise
 
 
-def format_report_line(index, stock):
-    score = ltr_signed(stock["score"])
-    previous_delta = ltr_signed(stock.get("previous_delta", 0.0))
-    value = int(stock.get("queue_value", 0))
-    parts = [f"{index}. {stock['symbol']}", score]
-    if value and stock.get("queue_side") == "buy":
-        parts.append(f"\u200e{value} B\u200e")
-    elif value and stock.get("queue_side") == "sell":
-        parts.append(f"\u200e-{value} B\u200e")
-    parts.append(f"قبل {previous_delta}")
-    return " | ".join(parts)
+def refresh_metadata(path,candidates,now,limit=4,session=None):
+    """Bounded concurrent cache work, invoked AFTER reporting, never per symbol inline."""
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import quote
+    import requests
+    path=Path(path); cache=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    due=[]
+    for row in sorted(candidates,key=lambda r:bool(cache.get(r['instrument'],{}).get('first_trade_date'))):
+        if not row.get('eligible_market_stock'): continue
+        entry=cache.get(row['instrument'],{})
+        retry=entry.get('retry_after')
+        if not retry and entry.get('first_trade_date') and entry.get('info') and entry.get('checked_at'):
+            retry=(datetime.fromisoformat(entry['checked_at'])+timedelta(days=7)).isoformat()
+        if retry and datetime.fromisoformat(retry)>now: continue
+        due.append(row)
+        if len(due)>=limit: break
+    def worker(row):
+        instrument=row['instrument']; entry=dict(cache.get(instrument,{})); client=session or requests.Session()
+        try:
+            response=client.get('https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/'+instrument,timeout=10); response.raise_for_status()
+            entry['info']=response.json()['instrumentInfo']
+        except Exception:
+            try:
+                response=client.get('https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/'+quote(row['symbol']),timeout=10); response.raise_for_status()
+                entry['info']=next(r for r in response.json()['instrumentSearch'] if str(r['insCode'])==instrument)
+            except Exception: pass
+        if not entry.get('first_trade_date'):
+            try:
+                url=f'https://old.tsetmc.com/tsev2/data/InstTradeHistory.aspx?i={instrument}&Top=9999&A=0'
+                response=client.get(url,timeout=15); response.raise_for_status()
+                rows=[r.split('@') for r in response.text.split(';') if r.strip()]
+                dates=[]
+                for r in rows:
+                    if len(r)!=10: raise ValueError('history schema changed')
+                    day=datetime.strptime(r[0],'%Y%m%d').date()
+                    if float(r[8])>0 and float(r[9])>0: dates.append(day)
+                if dates and len(rows)<9999:
+                    entry.update(first_trade_date=str(min(dates)),history_complete=True,history_source=url)
+            except Exception: entry['history_complete']=False
+        good=bool(entry.get('info')) and bool(entry.get('first_trade_date'))
+        entry.update(checked_at=now.isoformat(),retry_after=(now+timedelta(days=7 if good else 1)).isoformat())
+        return instrument,entry
+    with ThreadPoolExecutor(max_workers=max(1,min(limit,4))) as pool:
+        for instrument,entry in pool.map(worker,due): cache[instrument]=entry
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temp=path.with_suffix('.tmp'); temp.write_text(json.dumps(cache,ensure_ascii=False),encoding='utf-8'); temp.replace(path)
+    return cache
 
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS history (symbol TEXT NOT NULL, score REAL NOT NULL, timestamp TEXT NOT NULL)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_symbol_time ON history(symbol, timestamp)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS market_snapshots (
-            timestamp TEXT PRIMARY KEY,
-            count INTEGER NOT NULL,
-            average REAL NOT NULL,
-            median REAL NOT NULL,
-            buy_value_hmt REAL NOT NULL,
-            sell_value_hmt REAL NOT NULL,
-            leader_average REAL NOT NULL DEFAULT 0,
-            leader_median REAL NOT NULL DEFAULT 0
-        )""")
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(market_snapshots)")}
-        if "leader_average" not in columns:
-            conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_average REAL NOT NULL DEFAULT 0")
-        if "leader_median" not in columns:
-            conn.execute("ALTER TABLE market_snapshots ADD COLUMN leader_median REAL NOT NULL DEFAULT 0")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(timestamp)")
-
-        conn.execute("""CREATE TABLE IF NOT EXISTS stock_snapshots (
-            timestamp TEXT NOT NULL,
-            trading_date TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            instrument TEXT,
-            industry TEXT,
-            instrument_type TEXT,
-            yesterday_price REAL,
-            close_price REAL,
-            last_price REAL,
-            last_pct REAL,
-            trade_volume REAL,
-            trade_value_toman REAL,
-            buy_queue_volume REAL,
-            sell_queue_volume REAL,
-            buy_queue_value_toman REAL,
-            sell_queue_value_toman REAL,
-            score REAL,
-            valid INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY(timestamp, symbol)
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_snapshots_date_symbol ON stock_snapshots(trading_date, symbol)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS group_snapshots (
-            timestamp TEXT NOT NULL,
-            group_name TEXT NOT NULL,
-            count INTEGER NOT NULL,
-            average REAL NOT NULL,
-            median REAL NOT NULL,
-            turnover_toman REAL NOT NULL,
-            buy_value_hmt REAL NOT NULL,
-            sell_value_hmt REAL NOT NULL,
-            net_queue_hmt REAL NOT NULL,
-            PRIMARY KEY(timestamp, group_name)
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS industry_detail_snapshots (
-            timestamp TEXT NOT NULL,
-            industry TEXT NOT NULL,
-            count INTEGER NOT NULL,
-            average REAL NOT NULL,
-            median REAL NOT NULL,
-            turnover_toman REAL NOT NULL,
-            buy_value_hmt REAL NOT NULL,
-            sell_value_hmt REAL NOT NULL,
-            net_queue_hmt REAL NOT NULL,
-            PRIMARY KEY(timestamp, industry)
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS raw_tse_snapshots (
-            timestamp TEXT PRIMARY KEY,
-            trading_date TEXT NOT NULL,
-            stocks_path TEXT NOT NULL,
-            depth_path TEXT NOT NULL,
-            stocks_bytes INTEGER NOT NULL,
-            depth_bytes INTEGER NOT NULL,
-            stocks_sha256 TEXT NOT NULL,
-            depth_sha256 TEXT NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS daily_stock_summary (
-            trading_date TEXT NOT NULL, symbol TEXT NOT NULL, industry TEXT,
-            snapshot_count INTEGER NOT NULL, final_volume REAL, final_turnover_toman REAL,
-            average_score REAL, median_score REAL, min_score REAL, max_score REAL, last_score REAL,
-            max_buy_queue_toman REAL, max_sell_queue_toman REAL,
-            PRIMARY KEY(trading_date, symbol)
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS daily_market_summary (
-            trading_date TEXT PRIMARY KEY, snapshot_count INTEGER NOT NULL,
-            traded_stock_count INTEGER NOT NULL, average_score REAL, median_score REAL,
-            final_turnover_toman REAL, final_buy_value_hmt REAL, final_sell_value_hmt REAL,
-            average_net_queue_hmt REAL, final_net_queue_hmt REAL,
-            turnover_ratio_3_10 REAL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS daily_market_stats (
-            trading_date TEXT PRIMARY KEY,
-            turnover_hmt REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_snapshots_timestamp ON stock_snapshots(timestamp)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_group_snapshots_timestamp ON group_snapshots(timestamp)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_industry_detail_snapshots_timestamp ON industry_detail_snapshots(timestamp)")
-        conn.commit()
-
-
-def save_scores(stocks, now):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany("INSERT INTO history(symbol, score, timestamp) VALUES (?, ?, ?)", [(s["symbol"], s["score"], now.isoformat()) for s in stocks])
-        conn.execute("DELETE FROM history WHERE timestamp < ?", ((now - timedelta(days=31)).isoformat(),))
-
-
-def _snapshot_avg(symbols, start=None, end=None):
-    """Average the latest score for each symbol in a time window."""
-    if not symbols:
-        return None
-    marks = ",".join("?" for _ in symbols)
-    clauses = [f"symbol IN ({marks})"]
-    params = list(symbols)
-    if start:
-        clauses.append("timestamp >= ?")
-        params.append(start.isoformat())
-    if end:
-        clauses.append("timestamp < ?")
-        params.append(end.isoformat())
-    query = f"""
-        SELECT AVG(score) FROM (
-            SELECT score,
-                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
-            FROM history
-            WHERE {' AND '.join(clauses)}
-        ) WHERE rn = 1
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(query, params).fetchone()
-    return row[0] if row and row[0] is not None else None
-
-
-def previous_scores(symbols, now):
-    if not symbols:
-        return {}
-    marks = ",".join("?" for _ in symbols)
-    query = f"""
-        SELECT symbol, score FROM (
-            SELECT symbol, score,
-                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
-            FROM history
-            WHERE symbol IN ({marks}) AND timestamp < ?
-        ) WHERE rn = 1
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(query, list(symbols) + [now.isoformat()]).fetchall()
-    return {symbol: score for symbol, score in rows}
-
-
-def group_stats(stocks, now):
-    init_db()
-    symbols = [s["symbol"] for s in stocks]
-    current = sum(s["score"] for s in stocks) / len(stocks) if stocks else 0.0
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    previous = _snapshot_avg(symbols, end=now)
-    yesterday = _snapshot_avg(symbols, start=today_start - timedelta(days=1), end=today_start)
-    five_day = _snapshot_avg(symbols, start=today_start - timedelta(days=5), end=today_start)
-    return current, tuple(current - x if x is not None else 0.0 for x in (previous, yesterday, five_day))
-
-
-def fmt_delta(value):
-    return ltr_signed(value)
-
-
-def _float(value):
-    return float(value or 0)
-
-
-def is_derivative(symbol):
-    return any(symbol.startswith(p) for p in ("ض", "ط", "ص", "هـ", "سکه")) and any(c.isdigit() for c in symbol)
-
-
-def is_common_stock(symbol, description, instrument_type):
-    """Return True only for ordinary company shares.
-
-    TSETMC's instrument_type is not a complete asset-class classifier:
-    ordinary shares can use codes such as N1, N2, Z1, P1, 1N, and others.
-    Therefore classification is based on the instrument description/symbol,
-    with explicit exclusions for funds, rights, and non-stock instruments.
-    """
-    symbol = (symbol or "").strip()
-    description = (description or "").strip()
-    normalized = description.replace("ي", "ی").replace("ك", "ک")
-    excluded_terms = (
-        "صندوق", "ص.س.", "حق تقدم", "اوراق", "اختیار", "آتی",
-        "گواهی سپرده", "تسهیلات مسکن", "اسناد خزانه",
-    )
-    if not symbol or symbol.endswith("ح") or is_derivative(symbol):
-        return False
-    if any(term in normalized for term in excluded_terms):
-        return False
-    return True
-
+def convert_metadata(cache):
+    result={}
+    for instrument,entry in cache.items():
+        if not isinstance(entry,dict): continue
+        info=entry.get('info',{}); sector=info.get('sector') or {}
+        title=normalize(info.get('flowTitle','')+' '+info.get('cgrValCotTitle',''))
+        code=str(sector.get('cSecVal','')).strip().zfill(2)
+        result[instrument]=dict(entry,industry=INDUSTRIES.get(code,entry.get('industry')),market='base' if 'پایه' in title else 'main' if info.get('flow') in (1,2) else entry.get('market'),first_trade_date=entry.get('first_trade_date'))
+    return result
 
 def fetch_market_data(session=None):
-    session = session or requests.Session()
-    response = session.get(TSETMC_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-    response.raise_for_status()
-    parts = response.text.split("@")
-    if len(parts) < 4:
-        raise ValueError("unexpected TSETMC response format")
-    return parts[2].split(";"), parts[3].split(";")
+    import requests
+    session=session or requests.Session()
+    overview=[]
+    for market in (1,2):
+        response=session.get(f'https://cdn.tsetmc.com/api/MarketData/GetMarketOverview/{market}',timeout=15); response.raise_for_status()
+        overview.append(response.json()['marketOverview'])
+    dates=[str(o['marketActivityDEven']) for o in overview]
+    if len(set(dates))!=1: raise ValueError('market dates disagree')
+    market_date=datetime.strptime(dates[0],'%Y%m%d').date().isoformat()
+    asof=min(str(o['marketActivityHEven']).zfill(6) for o in overview)
+    response=session.get('https://old.tsetmc.com/tsev2/data/MarketWatchPlus.aspx?h=0&r=0',headers={'User-Agent':'Mozilla/5.0'},timeout=20); response.raise_for_status()
+    parts=response.text.split('@')
+    if len(parts)<4 or not parts[2]: raise ValueError('unexpected MarketWatch structure')
+    return dict(market_date=market_date,asof=f'{asof[:2]}:{asof[2:4]}:{asof[4:]}',stocks=parts[2].split(';'),depth=parts[3].split(';'),closed=all(o.get('marketState')=='F' for o in overview))
 
+def legacy_reports(store,stocks,now,output_dir):
+    """Keep deployed step3 rendering isolated; never apply its filters to v2."""
+    with store.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS v2_legacy(slot TEXT PRIMARY KEY,payload TEXT)')
+        cached=c.execute('SELECT payload FROM v2_legacy WHERE slot=?',(now.isoformat(),)).fetchone()
+    if cached: return json.loads(cached[0])
+    import importlib.util, gc
+    spec=importlib.util.spec_from_file_location('_legacy_bourse',Path(__file__).with_name('deployed_main.py'))
+    legacy=importlib.util.module_from_spec(spec); spec.loader.exec_module(legacy)
+    legacy.DB_PATH=store.path
+    legacy.init_db()
+    valid=[dict(s) for s in stocks if s.get('score') is not None]
+    funds=sorted([s for s in valid if s['symbol'] in LEVERAGED_FUNDS],key=lambda s:-s['score'])
+    leaders=sorted([s for s in valid if s['symbol'] in LEADERS],key=lambda s:-s['score'])
+    messages=[]
+    for key,title,rows,limit in [('leveraged','#اهرمی',funds,None),('leaders','#لیدر',leaders,10)]:
+        messages.append(dict(key='legacy_'+key+'_text',kind='text',text=legacy.build_group_message(title,rows,now,limit),parse_mode='HTML'))
+    legacy.save_scores(valid,now)
+    for key,title,rows in [('leveraged','#اهرمی',legacy.top_leveraged_for_chart(funds)),('leaders','#لیدر',legacy.top_leaders_for_chart(leaders))]:
+        chart=legacy.create_score_chart(title,rows,now,str(Path(output_dir)/(key+'.png')))
+        if chart: messages.append(dict(key='legacy_'+key+'_photo',kind='photo',path=chart,caption=title))
+    with store.connect() as c: c.execute('INSERT OR REPLACE INTO v2_legacy VALUES (?,?)',(now.isoformat(),json.dumps(messages,ensure_ascii=False)))
+    gc.collect()
+    return messages
 
-def parse_market_data(stocks_raw, depth_raw):
-    quotes = {}
-    for raw in depth_raw:
-        fields = raw.split(",")
-        if len(fields) < 8:
-            continue
+import logging
+
+class RejectedDelivery(Exception):
+    """Provider explicitly rejected; safe to retry, unlike transport ambiguity."""
+
+def deliver(store,slot,messages,sender):
+    import hashlib,shutil
+    for message in messages:
+        key=message['key']
+        with store.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row=c.execute('SELECT status FROM v2_delivery WHERE slot=? AND key=?',(slot,key)).fetchone()
+            if row and row[0] in ('sent','sending','uncertain'): continue
+            saved=c.execute('SELECT payload FROM v2_outbox WHERE slot=? AND key=?',(slot,key)).fetchone()
+            if saved: message=json.loads(saved[0])
+            else:
+                message=dict(message)
+                if message['kind']=='photo':
+                    assets=Path(store.path).parent/'delivery_assets'; assets.mkdir(exist_ok=True)
+                    target=assets/(hashlib.sha256((slot+key).encode()).hexdigest()+'.png')
+                    shutil.copyfile(message['path'],target); message['path']=str(target)
+                c.execute('INSERT INTO v2_outbox VALUES (?,?,?)',(slot,key,json.dumps(message,ensure_ascii=False)))
+            c.execute('INSERT OR REPLACE INTO v2_delivery VALUES (?,?,?,NULL,NULL)',(slot,key,'sending'))
         try:
-            row = {"buy_price": _float(fields[4]), "sell_price": _float(fields[5]), "buy_volume": _float(fields[6]), "sell_volume": _float(fields[7])}
-            quotes.setdefault(fields[0], []).append(row)
-        except (ValueError, IndexError):
-            continue
+            response=sender(message)
+            if not response.get('ok'): raise RejectedDelivery(str(response.get('description','rejected')))
+            message_id=response['result']['message_id']
+            with store.connect() as c: c.execute('UPDATE v2_delivery SET status=?,message_id=?,error=NULL WHERE slot=? AND key=?',('sent',message_id,slot,key))
+        except Exception as error:
+            status='retry' if isinstance(error,RejectedDelivery) else 'uncertain'
+            with store.connect() as c: c.execute('UPDATE v2_delivery SET status=?,error=? WHERE slot=? AND key=?',(status,type(error).__name__,slot,key))
+            logging.warning('Delivery %s %s: %s',key,status,type(error).__name__)
+    with store.connect() as c: return c.execute('SELECT key,status,message_id FROM v2_delivery WHERE slot=?',(slot,)).fetchall()
 
-    result = []
+def retry_pending(store,sender):
+    with store.connect() as c:
+        rows=c.execute("SELECT o.slot,o.payload FROM v2_outbox o JOIN v2_delivery d ON o.slot=d.slot AND o.key=d.key WHERE d.status='retry' ORDER BY o.slot").fetchall()
+    for slot,payload in rows: deliver(store,slot,[json.loads(payload)],sender)
+
+def run_cycle(store,now,fetcher,metadata,output_dir,sender=None):
+    now=now.astimezone(TEHRAN); slot=now.replace(second=0,microsecond=0)
+    if slot not in report_slots(now.date()): return []
+    health_path=Path(store.path).parent/'runtime_health.json'
+    try:
+        packet=fetcher()
+        source_date=packet['market_date']; source_time=datetime.fromisoformat(source_date+'T'+packet['asof']).replace(tzinfo=TEHRAN)
+        fresh=source_date==str(now.date()) and -60<=(now-source_time).total_seconds()<=300
+        health=dict(checked_at=now.isoformat(),market_date=source_date,source_asof=source_time.isoformat(),session_open=fresh,status='fresh' if fresh else 'stale')
+        temp=health_path.with_suffix('.tmp'); temp.write_text(json.dumps(health),encoding='utf-8'); temp.replace(health_path)
+        logging.info('Successfully fetched market data; market_date=%s status=%s',source_date,health['status'])
+        if not fresh: return []
+        stocks=parse_market_data(packet['stocks'],packet.get('depth'),metadata)
+        if not stocks: raise ValueError('empty parsed feed')
+        x,avg,n=store.turnover_metrics(now.date()); summary=summarize(stocks,now.date(),avg)
+        summary.update(turnover_x=x,completed_days=n)
+        # Once captured, a slot is immutable across send retries and restarts.
+        previous=dict(store.points(now.date())).get(slot)
+        if previous is None: store.save(slot,stocks,summary,packet)
+        else: summary=previous
+        store.prune(now)
+        messages=generate_reports(store,slot,summary,output_dir)
+        if sender: deliver(store,slot.isoformat(),messages,sender)
+        return messages
+    except Exception:
+        health_path.write_text(json.dumps(dict(checked_at=now.isoformat(),market_date=None,session_open=False,status='error')),encoding='utf-8')
+        raise
+
+
+def repair_legacy_summaries(store):
+    with store.connect() as c:
+        tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {'stock_snapshots','daily_stock_summary'}<=tables: return 0
+        groups=defaultdict(list)
+        for day,symbol,score in c.execute('SELECT trading_date,symbol,score FROM stock_snapshots WHERE valid=1 AND score IS NOT NULL ORDER BY timestamp'):
+            groups[(day,symbol)].append(score)
+        changed=0
+        for (day,symbol),values in groups.items():
+            changed+=c.execute('UPDATE daily_stock_summary SET median_score=?,last_score=? WHERE trading_date=? AND symbol=?',(statistics.median(values),values[-1],day,symbol)).rowcount
+    return changed
+
+def replay_archive(store,manifest_path,metadata=None):
+    import gzip
+    manifest_path=Path(manifest_path); manifest=json.loads(manifest_path.read_text(encoding='utf-8')); count=0
+    for entry in sorted(manifest,key=lambda r:r['timestamp']):
+        now=datetime.fromisoformat(entry['timestamp']).astimezone(TEHRAN)
+        if now.hour<9 or (now.hour,now.minute)>(12,25): continue
+        with gzip.open(manifest_path.parent/entry['stocks'],'rt',encoding='utf-8') as f: raw=json.load(f)
+        with gzip.open(manifest_path.parent/entry['depth'],'rt',encoding='utf-8') as f: depth=json.load(f)
+        stocks=parse_market_data(raw,depth,metadata)
+        x,avg,n=store.turnover_metrics(now.date()); summary=summarize(stocks,now.date(),avg)
+        summary.update(turnover_x=x,completed_days=n,historical=True)
+        store.save(now,stocks,summary,dict(stocks=raw,depth=depth)); count+=1
+    return count
+
+
+def fmt(value, decimals=1, percent=False):
+    return 'داده کافی نیست' if value is None else f"\u200e{value*(100 if percent else 1):.{decimals}f}{'%' if percent else ''}\u200e"
+
+def chart_series(store,now,summary):
+    points=dict(store.points(now.date()))
+    times=sorted(set(t for t in report_slots(now.date()) if t<=now)|set(t for t in points if t<=now))
+    if summary.get('historical'):
+        times=sorted(t for t in points if t<=now)
+    out={'times':times}
+    for key in ('median','leader_median','nonleader_median','queue_ratio'):
+        out[key]=[points.get(t,{}).get(key) for t in times]
+    out['turnover_x']=[summary.get('turnover_x') if t in points else None for t in times]
+    out['industries']={g['industry']:[next((h['median'] for h in points.get(t,{}).get('all_industries',[]) if h['industry']==g['industry']),None) for t in times] for g in summary['industries']}
+    return out
+
+def generate_reports(store,now,summary,output_dir,historical=False):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    def rtl(s): return get_display(arabic_reshaper.reshape(str(s)))
+    output_dir=Path(output_dir); output_dir.mkdir(parents=True,exist_ok=True)
+    stamp=('نمونه تاریخی — ' if historical else '')+now.strftime('%Y-%m-%d %H:%M')+' تهران'
+    series=chart_series(store,now,summary); times=series['times']
+    incident=store.incident(now); position,label=allocation(summary['leader_median'],summary['nonleader_median'])
+    def rating(key,kind):
+        n=stars(summary.get(key),kind)
+        return '—' if n is None else '⭐'*n+'☆'*(5-n)
+    text='\n'.join(['#وضعیت_بازار',stamp,f"میانه نمره بازار: {fmt(summary['median'])} {rating('median','median')}",f"روند ارزش معاملات MA5/MA15−1: {fmt(summary.get('turnover_x'),percent=True)} {rating('turnover_x','turnover')}",f"خالص صف / میانگین ۱۵ روز: {fmt(summary['queue_ratio'],percent=True)} {rating('queue_ratio','queue')}",f"صف خرید: {fmt(summary['buy_toman']/1e12 if summary['buy_toman'] is not None else None,0)} همت | صف فروش: {fmt(summary['sell_toman']/1e12 if summary['sell_toman'] is not None else None,0)} همت",f"تمایل بازار به لیدرها / هم‌وزن: {label}",f"سهام معامله‌شده: {summary['count']} | روز کامل پیشین: {summary.get('completed_days',0)}/15"])
+    colors=['#1565c0','#c62828','#2e7d32','#6a1b9a','#ef6c00','#00838f','#4527a0','#ad1457','#558b2f','#283593','#d84315','#00695c','#8e24aa','#5d4037','#0277bd','#9e9d24']
+    def plot(ax,values,label,color):
+        ax.set_title(rtl(label))
+        if not any(v is not None for v in values):
+            ax.set_yticks([]); ax.set_xticks([])
+            ax.text(.5,.5,rtl('داده کافی نیست — نیاز به ۱۵ روز کامل'),transform=ax.transAxes,ha='center',fontsize=16)
+            return
+        ax.plot(times,[float('nan') if v is None else v for v in values],label=rtl(label),color=color,marker='o',markersize=4,linewidth=2)
+        if times:
+            ticks=sorted(set([times[0],times[-1]]+[t for t in times if t.minute in (0,30)]))
+            ax.set_xticks(ticks)
+
+        ax.grid(alpha=.25); ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M',tz=TEHRAN))
+        ax.set_xlim(now.replace(hour=9,minute=0),now.replace(hour=12,minute=25))
+        ax.legend(loc='best'); ax.set_xlabel(rtl('زمان تهران'))
+        if not any(v is not None for v in values): ax.text(.5,.5,rtl('داده کافی نیست'),transform=ax.transAxes,ha='center')
+    plt.rcParams['font.family']='DejaVu Sans'
+    fig,axes=plt.subplots(3,1,figsize=(15,12),layout='constrained')
+    for ax,key,title in zip(axes,['turnover_x','median','queue_ratio'],['روند ارزش معاملات — ثابت روزانه','میانه نمره بازار','نسبت خالص صف به میانگین ارزش معاملات ۱۵ روز']):
+        values=series[key] if key=='median' else [None if v is None else v*100 for v in series[key]]
+        plot(ax,values,title,colors[0])
+        ax.set_ylabel(rtl('نمره' if key=='median' else 'درصد'))
+
+    fig.suptitle(rtl(stamp)); p1=output_dir/'market_panels.png'; fig.savefig(p1,dpi=150); plt.close(fig)
+    fig,ax=plt.subplots(figsize=(15,7),layout='constrained')
+    for industry,values in series['industries'].items(): plot(ax,values,industry,colors[list(INDUSTRIES.values()).index(industry)])
+    if not series['industries']:
+        ax.set_axis_off()
+        ax.text(.5,.5,rtl('صنعتی با میانه غیرمنفی وجود ندارد'),ha='center',transform=ax.transAxes,fontsize=18)
+    ax.set_title(rtl('پنج صنعت برتر فعلی — تاریخچه کامل روز | '+stamp)); p2=output_dir/'industries.png'; fig.savefig(p2,dpi=150); plt.close(fig)
+    fig,(ax,gauge)=plt.subplots(2,1,figsize=(15,8),gridspec_kw={'height_ratios':[5,1]},layout='constrained')
+    plot(ax,series['leader_median'],'میانه لیدرها',colors[0]); plot(ax,series['nonleader_median'],'میانه غیرلیدرها',colors[1]); ax.set_title(rtl(stamp))
+    ax.set_ylabel(rtl('نمره'))
+    gauge.set_xlim(.5,5.5); gauge.set_ylim(0,1); gauge.set_yticks([])
+    gauge.set_xticks(range(1,6),[rtl(x) for x in ['هم‌وزن شدید','هم‌وزن نسبی','خنثی','لیدر نسبی','لیدر شدید']]); gauge.scatter(range(1,6),[.5]*5,c='#dddddd',s=250)
+    if position: gauge.scatter([position],[.5],c='#1565c0',s=300)
+    gauge.set_title(rtl('تمایل بازار به لیدرها / هم‌وزن — '+label)); p3=output_dir/'allocation.png'; fig.savefig(p3,dpi=150); plt.close(fig)
+    industry_lines=['#صنایع_برتر',stamp]
+    for g in summary['industries']:
+        industry_lines.append(f"{g['industry']} | میانه {fmt(g['median'])} | {g['count']} سهم")
+        for i,s in enumerate(g['stocks'],1):
+            inc=incident['by_symbol'].get(s['symbol'],{})
+            market={'base':'پایه','main':'اصلی'}.get(s.get('market'),'نامشخص')
+            industry_lines.append(f"{i}. {s['symbol']} | {fmt(s['score'])} | {market} | Incident {fmt(inc.get('median'))} ({inc.get('count',0)} نمره؛ {'ناقص' if inc.get('partial',True) else 'کامل'})")
+    if not summary['industries']: industry_lines.append('صنعتی با میانه غیرمنفی وجود ندارد')
+    messages=[dict(key='market_text',kind='text',text=text),dict(key='market_panels',kind='photo',path=str(p1),caption='#روند_بازار '+stamp),dict(key='industry_text',kind='text',text='\n'.join(industry_lines)),dict(key='industries',kind='photo',path=str(p2),caption='#روند_صنایع '+stamp),dict(key='allocation',kind='photo',path=str(p3),caption='#تمایل_بازار '+stamp)]
+    (output_dir/'messages.json').write_text(json.dumps(messages,ensure_ascii=False,indent=2),encoding='utf-8')
+    return messages
+
+import sqlite3
+import json
+from pathlib import Path
+
+class Store:
+    """Versioned tables never reinterpret unverified legacy day totals as complete."""
+    def __init__(self,path):
+        self.path=str(path); Path(path).parent.mkdir(parents=True,exist_ok=True)
+        with self.connect() as c:
+            c.executescript('''CREATE TABLE IF NOT EXISTS v2_slots(ts TEXT PRIMARY KEY,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS v2_detail(ts TEXT,symbol TEXT,payload TEXT,PRIMARY KEY(ts,symbol));
+            CREATE TABLE IF NOT EXISTS v2_raw(ts TEXT PRIMARY KEY,payload TEXT);
+            CREATE TABLE IF NOT EXISTS v2_outbox(slot TEXT,key TEXT,payload TEXT,PRIMARY KEY(slot,key));
+            CREATE TABLE IF NOT EXISTS v2_days(day TEXT PRIMARY KEY,turnover REAL,source TEXT,complete INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS v2_daily_scores(day TEXT,symbol TEXT,payload TEXT,PRIMARY KEY(day,symbol));
+            CREATE TABLE IF NOT EXISTS v2_delivery(slot TEXT,key TEXT,status TEXT,message_id INTEGER,error TEXT,PRIMARY KEY(slot,key));''')
+    from contextlib import contextmanager
+    @contextmanager
+    def connect(self):
+        c=sqlite3.connect(self.path,timeout=30)
+        try:
+            with c: yield c
+        finally: c.close()
+    def save(self,now,stocks,summary,raw=None):
+        ts=now.isoformat()
+        with self.connect() as c:
+            c.execute('INSERT OR REPLACE INTO v2_slots VALUES (?,?)',(ts,json.dumps(summary,ensure_ascii=False)))
+            c.executemany('INSERT OR REPLACE INTO v2_detail VALUES (?,?,?)',[(ts,s['symbol'],json.dumps(s,ensure_ascii=False)) for s in stocks])
+            if raw is not None: c.execute('INSERT OR REPLACE INTO v2_raw VALUES (?,?)',(ts,json.dumps(raw,ensure_ascii=False)))
+        daily=self.daily_scores(now.date())
+        with self.connect() as c:
+            c.executemany('INSERT OR REPLACE INTO v2_daily_scores VALUES (?,?,?)',[(str(now.date()),symbol,json.dumps(values)) for symbol,values in daily.items()])
+    def points(self,day):
+        with self.connect() as c: rows=c.execute('SELECT ts,payload FROM v2_slots WHERE substr(ts,1,10)=? ORDER BY ts',(str(day),)).fetchall()
+        return [(datetime.fromisoformat(ts),json.loads(p)) for ts,p in rows]
+    def daily_scores(self,day):
+        with self.connect() as c: rows=c.execute('SELECT payload FROM v2_detail WHERE substr(ts,1,10)=? ORDER BY ts',(str(day),)).fetchall()
+        groups=defaultdict(list)
+        for (p,) in rows:
+            s=json.loads(p)
+            if s.get('score') is not None: groups[s['symbol']].append(s['score'])
+        return {k:dict(count=len(v),mean=statistics.mean(v),median=statistics.median(v),min=min(v),max=max(v),last=v[-1]) for k,v in groups.items()}
+    def incident(self,now):
+        start=datetime.combine(now.date()-timedelta(days=29),datetime.min.time(),TEHRAN)
+        with self.connect() as c: rows=c.execute('SELECT ts,payload FROM v2_detail WHERE ts>=? AND ts<=?',(start.isoformat(),now.isoformat())).fetchall()
+        scores=[]; slots=set(); by_symbol=defaultdict(list)
+        for ts,p in rows:
+            s=json.loads(p); dt=datetime.fromisoformat(ts)
+            if (dt.hour,dt.minute)<(9,5) or (dt.hour,dt.minute)>(12,25): continue
+            if s.get('eligible_market_stock') and s.get('trade_volume',0)>0 and s.get('score') is not None:
+                scores.append(s['score']); slots.add(ts); by_symbol[s['symbol']].append(s['score'])
+        expected=sum(len(report_slots(start.date()+timedelta(days=i))) for i in range(30))
+        return dict(median=median(scores),count=len(scores),slots=len(slots),partial=len(slots)<expected,by_symbol={k:dict(median=median(v),count=len(v),partial=len(v)<expected) for k,v in by_symbol.items()})
+    def finalize_day(self,day,turnover,verified=False,source=''):
+        if not verified or not source or turnover is None or not math.isfinite(turnover) or turnover<0: return False
+        with self.connect() as c:
+            c.execute('INSERT INTO v2_days VALUES (?,?,?,1) ON CONFLICT(day) DO UPDATE SET turnover=excluded.turnover,source=excluded.source,complete=1',(str(day),turnover,source))
+        return True
+    def turnover_metrics(self,day):
+        with self.connect() as c: rows=c.execute('SELECT turnover FROM v2_days WHERE day<? AND complete=1 ORDER BY day DESC LIMIT 15',(str(day),)).fetchall()
+        values=[r[0] for r in rows]
+        if len(values)<15: return None,None,len(values)
+        avg=statistics.mean(values)
+        return (statistics.mean(values[:5])/avg-1 if avg>0 else None),avg,len(values)
+    def prune(self,now):
+        cutoff=datetime.combine(now.date()-timedelta(days=29),datetime.min.time(),TEHRAN).isoformat()
+        with self.connect() as c:
+            for table in ('v2_detail','v2_raw'): c.execute(f'DELETE FROM {table} WHERE ts<?',(cutoff,))
+            tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ('history','stock_snapshots','raw_tse_snapshots','group_snapshots','industry_detail_snapshots'):
+                if table in tables: c.execute(f'DELETE FROM {table} WHERE timestamp<?',(cutoff,))
+        for path in (Path(self.path).parent/'raw_tse').glob('*.json.gz'):
+            try: day=datetime.strptime(path.name[:15],'%Y%m%dT%H%M%S').date()
+            except ValueError: continue
+            if str(day)<cutoff[:10]: path.unlink()
+
+
+import statistics
+from collections import defaultdict
+LEADERS = {'ذوب','فملی','فولاد','تاپیکو','شستا','شبریز','شتران','وغدیر','شپنا','شبندر','پالایش','خگستر','فارس','خودرو','وبصادر','وبملت','خساپا','دارا یکم','پارسان','وتجارت'}
+LEVERAGED_FUNDS = {'اهرم','شتاب','موج','جهش','توان','نارنج','بیدار'}
+INDUSTRIES = {'34':'خودرو','57':'بانک','44':'محصولات شیمیایی','13':'استخراج کانه‌های فلزی','39':'شرکت‌های چندرشته‌ای صنعتی','27':'فلزات اساسی','23':'فرآورده‌های نفتی','70':'انبوه‌سازی','56':'سرمایه‌گذاری','28':'محصولات فلزی','66':'بیمه','43':'محصولات دارویی','53':'سیمان','42':'محصولات غذایی','01':'زراعت','49':'کاشی'}
+
+def normalize(text):
+    return str(text or '').replace('ي','ی').replace('ك','ک').strip()
+
+def is_common_stock(symbol, description, instrument_type=''):
+    symbol,description=normalize(symbol),normalize(description)
+    excluded=('صندوق','ص.س.','حق تقدم','اوراق','اختیار','آتی','گواهی سپرده','تسهیلات مسکن','اسناد خزانه','بلوک','عمده')
+    return bool(symbol) and not symbol.endswith('ح') and not any(c.isdigit() for c in symbol) and not any(t in description for t in excluded)
+
+def parse_market_data(stocks_raw, depth_raw, metadata=None):
+    metadata=metadata or {}; depth=defaultdict(list); bad_books=set()
+    for raw in depth_raw if isinstance(depth_raw,(list,tuple)) else []:
+        if not isinstance(raw,str) or not raw.strip(): continue
+        f=raw.split(',')
+        try:
+            if len(f)<8 or not f[0]: raise ValueError('malformed depth row')
+            values=tuple(float(x) for x in f[4:8])
+            if not all(math.isfinite(x) and x>=0 for x in values): raise ValueError('invalid depth value')
+            depth[f[0]].append(values)
+        except ValueError: bad_books.add(f[0])
+    book_available=any(rows for instrument,rows in depth.items() if instrument not in bad_books)
+    result=[]
     for raw in stocks_raw:
-        fields = raw.split(",")
-        if len(fields) < 23:
-            continue
+        f=raw.split(',')
         try:
-            instrument = fields[0]
-            symbol = fields[2].replace("ي", "ی").replace("ك", "ک").strip()
-            yesterday = _float(fields[13]); close = _float(fields[6]); last = _float(fields[7])
-            trade_volume = _float(fields[9]); max_price = _float(fields[19]); min_price = _float(fields[20])
-            instrument_type = fields[25].strip() if len(fields) > 25 else ""
-            description = fields[3].replace("ي", "ی").replace("ك", "ک").strip() if len(fields) > 3 else ""
-            eligible_market_stock = is_common_stock(symbol, description, instrument_type)
-            if not symbol or yesterday <= 0 or is_derivative(symbol):
-                continue
-            last_pct = round((last - yesterday) / yesterday * 100, 2)
-            rows = quotes.get(instrument, [])
-            buy_volume = sum(r["buy_volume"] for r in rows if r["buy_volume"] > 0 and max_price > 0 and r["buy_price"] >= max_price - 1)
-            sell_volume = sum(r["sell_volume"] for r in rows if r["sell_volume"] > 0 and min_price > 0 and r["sell_price"] <= min_price + 1)
-            best_buy_price = max((r["buy_price"] for r in rows), default=0)
-            sell_prices = [r["sell_price"] for r in rows if r["sell_price"] > 0]
-            best_sell_price = min(sell_prices, default=0)
-            buy_queue = buy_volume > 0 and best_buy_price >= max_price - 1
-            sell_queue = sell_volume > 0 and best_sell_price <= min_price + 1
-            buy_value_toman = best_buy_price * buy_volume / 10 if buy_queue else 0.0
-            sell_value_toman = best_sell_price * sell_volume / 10 if sell_queue else 0.0
-            if buy_queue and not sell_queue:
-                side, volume, price = "buy", buy_volume, best_buy_price
-            elif sell_queue and not buy_queue:
-                side, volume, price = "sell", sell_volume, best_sell_price
-            else:
-                side, volume, price = None, 0, 0
-            result.append({"instrument": instrument, "symbol": symbol, "score": calculate_score(last_pct, buy_volume if buy_queue else 0, sell_volume if sell_queue else 0, trade_volume), "trade_volume": trade_volume, "trade_value_toman": _float(fields[10]) / 10, "eligible_market_stock": eligible_market_stock, "instrument_type": instrument_type, "description": description, "yesterday_price": yesterday, "close_price": close, "last_price": last, "last_pct": last_pct, "buy_queue_volume": buy_volume if buy_queue else 0, "sell_queue_volume": sell_volume if sell_queue else 0, "buy_queue_value_toman": buy_value_toman, "sell_queue_value_toman": sell_value_toman, "queue_value": queue_value_billion_toman(price, volume) if side else 0, "queue_side": side})
-        except (ValueError, IndexError, ZeroDivisionError):
-            continue
+            if len(f)<23: continue
+            yesterday,last,volume,hi,lo=map(float,[f[13],f[7],f[9],f[19],f[20]])
+            if yesterday<=0 or volume<0: continue
+            symbol=normalize(f[2]); meta=metadata.get(f[0],{})
+            rows=depth[f[0]]
+            buy=sum(bv for bp,sp,bv,sv in rows if bp==hi and hi>0 and bv>0)
+            sell=sum(sv for bp,sp,bv,sv in rows if sp==lo and lo>0 and sv>0)
+            # A limit order is not a queue if immediately executable opposing orders exist.
+            if any(sp>0 and sp<=hi and sv>0 for bp,sp,bv,sv in rows): buy=0
+            if any(bp>=lo and bv>0 for bp,sp,bv,sv in rows): sell=0
+            pct=(last-yesterday)*100/yesterday
+            item=dict(instrument=f[0],symbol=symbol,description=normalize(f[3]),instrument_type=f[25] if len(f)>25 else '',yesterday_price=yesterday,last_price=last,trade_volume=volume,trade_value_toman=float(f[10])/10,last_pct=pct,buy_queue_volume=buy,sell_queue_volume=sell,buy_queue_value_toman=buy*hi/10,sell_queue_value_toman=sell*lo/10,score=calculate_score(pct,buy,sell,volume,(hi-yesterday)*100/yesterday,(lo-yesterday)*100/yesterday),industry=meta.get('industry') or INDUSTRIES.get(f[18].zfill(2)),market=meta.get('market') or ('base' if f[15]=='4' else 'main' if f[15] in ('1','2') else None),first_trade_date=meta.get('first_trade_date'))
+            item['eligible_market_stock']=f[22] in {'300','303','309','313'} and f[1].startswith('IRO') and f[1].endswith('0001')
+            item.update(yval=f[22],instrument_id=f[1],close_price=float(f[6]))
+            item['queue_side']='buy' if buy else 'sell' if sell else None
+            item['queue_value']=int((item['buy_queue_value_toman'] or item['sell_queue_value_toman'])/1e9)
+            if not book_available or f[0] in bad_books:
+                item.update(score=None,buy_queue_volume=None,sell_queue_volume=None,
+                            buy_queue_value_toman=None,sell_queue_value_toman=None,
+                            queue_side=None,queue_value=None,book_valid=False)
+            result.append(item)
+        except (ValueError,IndexError): continue
     return result
 
+def median(values):
+    values=[v for v in values if v is not None and math.isfinite(v)]
+    return statistics.median(values) if values else None
 
-def market_summary_values(stocks):
-    eligible = [s for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
-    scores = [float(s["score"]) for s in eligible]
-    average = statistics.mean(scores) if scores else 0.0
-    median = statistics.median(scores) if scores else 0.0
-    buy_value_hmt = sum(float(s.get("buy_queue_value_toman", 0)) for s in eligible) / 1_000_000_000_000
-    sell_value_hmt = sum(float(s.get("sell_queue_value_toman", 0)) for s in eligible) / 1_000_000_000_000
-    return len(scores), average, median, buy_value_hmt, sell_value_hmt
+def summarize(stocks, day, average15=None):
+    ordinary=[s for s in stocks if s.get('eligible_market_stock')]
+    traded=[s for s in ordinary if s.get('trade_volume',0)>0 and s.get('score') is not None]
+    leader=[s for s in stocks if s['symbol'] in LEADERS and s.get('trade_volume',0)>0]
+    buy=sell=0
+    for s in ordinary:
+        first=s.get('first_trade_date')
+        young=first and 0<=(day-date.fromisoformat(first)).days<30
+        if not young: buy+=s.get('buy_queue_value_toman') or 0
+        sell+=s.get('sell_queue_value_toman') or 0
+    industries=[]
+    for industry in INDUSTRIES.values():
+        members=sorted([s for s in traded if s.get('industry')==industry],key=lambda s:(-s['score'],s['symbol']))
+        med=median([s['score'] for s in members])
+        if med is not None: industries.append(dict(industry=industry,median=med,count=len(members),stocks=members[:5]))
+    industries.sort(key=lambda g:(-g['median'],g['industry']))
+    queues_valid=bool(ordinary) and all(s.get('book_valid',True) for s in ordinary)
+    return dict(count=len(traded),median=median([s['score'] for s in traded]),leader_median=median([s.get('score') for s in leader]),nonleader_median=median([s['score'] for s in traded if s['symbol'] not in LEADERS]),buy_toman=buy if queues_valid else None,sell_toman=sell if queues_valid else None,queue_ratio=(buy-sell)/average15 if average15 and queues_valid else None,turnover_toman=sum(s.get('trade_value_toman') or 0 for s in ordinary) if ordinary else None,industries=[g for g in industries if g['median']>=0][:5],all_industries=industries)
 
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+TEHRAN = ZoneInfo('Asia/Tehran')
 
-def market_allocation_signal(market_median, leader_median):
-    gap = float(market_median) - float(leader_median)
-    if gap > 1.0:
-        return "تمایل شدید به سهام هم‌وزن"
-    if gap >= 0.5:
-        return "تمایل به سهام هم‌وزن"
-    if gap < -1.0:
-        return "تمایل شدید به لیدرها"
-    if gap <= -0.5:
-        return "تمایل به سهام لیدرها"
-    return "تمایل خاصی وجود ندارد"
+def report_slots(day):
+    if day.weekday() in (3,4): return []
+    first=datetime.combine(day,datetime.min.time(),TEHRAN).replace(hour=9,minute=5)
+    return [first+timedelta(minutes=10*i) for i in range(21)]
 
+def stars(value, kind):
+    if value is None: return None
+    a,b,c,d={'median':(2,1,-1,-2),'turnover':(.25,.10,-.10,-.25),'queue':(.50,.20,-.20,-.50)}[kind]
+    return 5 if value>a else 4 if value>b else 3 if value>=c else 2 if value>=d else 1
 
-def classify_median(value):
-    if value > 2: return "عالی"
-    if value > 1: return "خوب"
-    if value >= -1: return "معمولی"
-    if value >= -2: return "بد"
-    return "افتضاح"
+def allocation(leader, nonleader):
+    if leader is None or nonleader is None: return None, 'داده کافی نیست'
+    d=leader-nonleader
+    n=5 if d>1.5 else 4 if d>.5 else 3 if d>=-.5 else 2 if d>=-1.5 else 1
+    return n, {5:'تمایل شدید به لیدرها',4:'تمایل نسبی به لیدرها',3:'خنثی',2:'تمایل نسبی به هم‌وزن',1:'تمایل شدید به هم‌وزن'}[n]
 
-
-def classify_imbalance(value):
-    if value > 20: return "عالی"
-    if value > 5: return "خوب"
-    if value >= -5: return "معمولی"
-    if value >= -20: return "بد"
-    return "افتضاح"
-
-
-def classify_turnover_ratio(value):
-    if value is None: return "داده کافی نیست"
-    if value > 1.5: return "عالی"
-    if value >= 1.2: return "خوب"
-    if value >= 0.8: return "معمولی"
-    if value >= 0.6: return "بد"
-    return "افتضاح"
-
-
-def status_stars(status):
-    """Render every indicator on a fixed five-star scale."""
-    filled = {
-        "عالی": 5,
-        "خوب": 4,
-        "معمولی": 3,
-        "بد": 2,
-        "افتضاح": 1,
-    }.get(status, 0)
-    if not status in {"عالی", "خوب", "معمولی", "بد", "افتضاح"}:
-        return "—"
-    return "⭐" * filled + "☆" * (5 - filled)
-
-
-def turnover_ratio_text(ratio):
-    """Format the 3-day/10-day turnover ratio for the report footer."""
-    return f"‎{float(ratio):.2f}‎" if ratio is not None else "داده کافی نیست"
-
-
-def update_daily_turnover(stocks, now):
-    turnover_hmt = sum(float(s.get("trade_value_toman", 0)) for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0) / 1_000_000_000_000
-    date = now.date().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO daily_market_stats VALUES (?, ?, ?)", (date, turnover_hmt, now.isoformat()))
-        rows = conn.execute("SELECT turnover_hmt FROM daily_market_stats ORDER BY trading_date DESC LIMIT 10").fetchall()
-    values = [row[0] for row in rows]
-    ratio = sum(values[:3]) / 3 / (sum(values[:10]) / len(values)) if len(values) >= 10 and sum(values[:10]) else None
-    return turnover_hmt, ratio, classify_turnover_ratio(ratio)
-
-
-CONFIGURED_INDUSTRIES = (
-    "فلزات اساسی", "خودرو", "محصولات دارویی", "محصولات غذایی", "سیمان",
-    "شرکتهای چند رشته ای", "شیمیایی", "بانک", "فراورده های نفتی",
-    "استخراج کانه فلزی", "زراعت", "محصولات فلزی", "کاشی سرامیک",
-)
-
-INDUSTRY_NAMES = {
-    "فلزات اساسي": "فلزات اساسی", "فلزات اساسی": "فلزات اساسی",
-    "محصولات دارويي": "محصولات دارویی", "محصولات دارویی": "محصولات دارویی",
-    "محصولات غذايي": "محصولات غذایی", "محصولات غذایی": "محصولات غذایی",
-    "سيمان": "سیمان", "سیمان": "سیمان", "سیمان، آهک و گچ": "سیمان",
-    "شيميايي": "شیمیایی", "شیمیایی": "شیمیایی", "محصولات شیمیایی": "شیمیایی",
-    "بانکها و موسسات اعتباری": "بانک", "بانک": "بانک",
-    "محصولات دارویی": "محصولات دارویی", "مواد و محصولات دارویی": "محصولات دارویی",
-    "محصولات غذایی و آشامیدنی به جز قند و شکر": "محصولات غذایی",
-    "خودرو و ساخت قطعات": "خودرو",
-    "سیمان، آهک و گچ": "سیمان",
-    "محصولات شیمیایی": "شیمیایی",
-    "فراورده های نفتی، کک و سوخت هسته ای": "فراورده های نفتی",
-    "استخراج کانه های فلزی": "استخراج کانه فلزی",
-    "ساخت محصولات فلزی": "محصولات فلزی",
-    "شرکتهای چند رشته ای صنعتی": "شرکتهای چند رشته ای",
-    "زراعت و خدمات وابسته": "زراعت",
-    "محصولات غذايي": "محصولات غذایی", "محصولات غذایی": "محصولات غذایی",
-    "محصولات غذایی و آشامیدنی به جز قند و شکر": "محصولات غذایی",
-    "خودرو و ساخت قطعات": "خودرو",
-    "فراورده هاي نفتي": "فراورده های نفتی", "فراورده های نفتی": "فراورده های نفتی",
-    "فراورده های نفتی، کک و سوخت هسته ای": "فراورده های نفتی",
-    "استخراج کانه هاي فلزي": "استخراج کانه فلزی", "استخراج کانه فلزی": "استخراج کانه فلزی",
-    "استخراج کانه های فلزی": "استخراج کانه فلزی",
-    "محصولات فلزي": "محصولات فلزی", "محصولات فلزی": "محصولات فلزی", "ساخت محصولات فلزی": "محصولات فلزی",
-    "کاشي و سراميک": "کاشی سرامیک", "کاشی و سرامیک": "کاشی سرامیک",
-    "چند رشته ای": "شرکتهای چند رشته ای", "شرکتهای چند رشته ای": "شرکتهای چند رشته ای",
-    "شرکتهای چند رشته ای صنعتی": "شرکتهای چند رشته ای",
-    "زراعت و خدمات وابسته": "زراعت", "زراعت": "زراعت",
-}
-
-
-def normalize_industry(name):
-    normalized = str(name or "").replace("ي", "ی").replace("ك", "ک").strip()
-    return INDUSTRY_NAMES.get(normalized, normalized or None)
-
-
-def instrument_type_label(code):
-    return {"N1": "سهام بازار بورس", "N2": "فرابورس - بازار پایه"}.get(code, code)
-
-
-def attach_industries(stocks, session=None):
-    """Attach TSE sector names; cache them so only unknown instruments hit TSE."""
-    cache_path = os.path.join(os.path.dirname(DB_PATH) or ".", "industry_cache.json")
-    try:
-        with open(cache_path, encoding="utf-8") as fh:
-            cache = json.load(fh)
-    except (OSError, ValueError):
-        cache = {}
-    client = session or requests.Session()
-    changed = False
-    for stock in stocks:
-        if not (stock.get("eligible_market_stock") and float(stock.get("trade_volume", 0)) > 0):
-            continue
-        code = stock.get("instrument")
-        if not code:
-            continue
-        if code not in cache or not cache.get(code):
-            try:
-                payload = client.get(f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{code}", timeout=10).json()
-                sector = payload.get("instrumentInfo", {}).get("sector", {}).get("lSecVal")
-                cache[code] = normalize_industry(sector)
-                changed = True
-            except (OSError, ValueError, requests.RequestException):
-                continue
-        raw_industry = cache.get(code)
-        stock["industry_raw"] = cache.get(f"{code}:raw") or raw_industry
-        stock["industry"] = normalize_industry(raw_industry)
-        if stock["industry"] != raw_industry:
-            cache[code] = stock["industry"]
-            changed = True
-    if changed:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False)
-    return stocks
-
-
-def industry_stats(stocks):
-    """Return traded, configured industries with median and top stock scores."""
-    grouped = defaultdict(list)
-    for stock in stocks:
-        industry = stock.get("industry")
-        if (
-            industry in CONFIGURED_INDUSTRIES
-            and stock.get("eligible_market_stock")
-            and float(stock.get("trade_volume", 0)) > 0
-        ):
-            grouped[industry].append(stock)
-    return [
-        {
-            "industry": industry,
-            "median": statistics.median(float(stock["score"]) for stock in members),
-            "top_stocks": sorted(members, key=lambda stock: float(stock["score"]), reverse=True)[:5],
-        }
-        for industry, members in grouped.items()
-    ]
-
-
-def save_industry_snapshot(values, now):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS industry_snapshots (timestamp TEXT NOT NULL, industry TEXT NOT NULL, median REAL NOT NULL, PRIMARY KEY(timestamp, industry))"
-        )
-        conn.executemany(
-            "INSERT OR REPLACE INTO industry_snapshots(timestamp, industry, median) VALUES (?, ?, ?)",
-            [(now.isoformat(), industry, float(median)) for industry, median in values.items()],
-        )
-
-
-def build_industry_message(stocks, now, limit=None):
-    current = industry_stats(stocks)
-    if not current:
-        return "#صنایع"
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS industry_snapshots (timestamp TEXT NOT NULL, industry TEXT NOT NULL, median REAL NOT NULL, PRIMARY KEY(timestamp, industry))"
-        )
-        old_rows = conn.execute(
-            "SELECT industry, median FROM industry_snapshots WHERE timestamp < ? ORDER BY timestamp DESC",
-            (now.isoformat(),),
-        ).fetchall()
-    previous = {}
-    for industry, median in old_rows:
-        previous.setdefault(industry, median)
-    all_symbols = [stock["symbol"] for item in current for stock in item["top_stocks"]]
-    previous_stock_scores = previous_scores(all_symbols, now)
-    ranked = sorted(current, key=lambda item: item["median"], reverse=True)
-    if limit:
-        ranked = ranked[:limit]
-    lines = ["#صنایع"]
-    for index, item in enumerate(ranked, 1):
-        delta = item["median"] - float(previous.get(item["industry"], 0.0))
-        lines.append(f"{index}. {item['industry']} | {ltr_signed(item['median'])} | قبل ‎{delta:+.1f}‎")
-        for stock_index, stock in enumerate(item["top_stocks"], 1):
-            score = float(stock["score"])
-            previous_score = previous_stock_scores.get(stock["symbol"])
-            stock_delta = score - float(previous_score) if previous_score is not None else 0.0
-            lines.append(
-                f"   {stock_index}) {stock['symbol']} | {ltr_signed(score)} | قبل {ltr_signed(stock_delta)}"
-            )
-    return "\n".join(lines)
-
-
-def market_summary(stocks, previous=None, leader_stats=None, turnover=None):
-    count, _average, median, buy_hmt, sell_hmt = market_summary_values(stocks)
-    imbalance = buy_hmt - sell_hmt
-    median_status = classify_median(median)
-    imbalance_status = classify_imbalance(imbalance)
-    ratio_status = turnover[2] if turnover is not None else "داده کافی نیست"
-    lines = [
-        "📊 <b>#وضعیت_بازار</b>",
-        "",
-        f"امتیاز کل بازار: {status_stars(median_status)}",
-        f"تقاضا: {status_stars(imbalance_status)}",
-        f"ارزش معاملات: {status_stars(ratio_status)}",
-        "",
-    ]
-    if leader_stats is not None:
-        leader_average, leader_median = leader_stats
-        gap = median - leader_median
-        # Map the market-vs-leaders gap onto the same five-position visual scale.
-        position = max(0, min(14, 7 + round(gap * 3)))
-        allocation_slider = "👑 " + "─" * position + "●" + "─" * (14 - position) + " 🏘️"
-        lines.extend([
-            "تمایل پول:",
-            allocation_slider,
-            "",
-        ])
-    lines.extend([
-        "🏦 <b>کل بازار</b>",
-        f"میانه: {ltr_signed(median)} | قبل: {ltr_signed(median - previous[2]) if previous else ltr_signed(0)}",
-        f"تعداد سهام معامله‌شده: {count}",
-        "",
-    ])
-    if leader_stats is not None:
-        leader_average, leader_median = leader_stats
-        previous_leader_median = previous[6] if previous and len(previous) > 6 else None
-        leader_median_delta = leader_median - previous_leader_median if previous_leader_median is not None else 0
-        lines.extend([
-            "👑 <b>لیدرها</b>",
-            f"میانه: {ltr_signed(leader_median)} | قبل: {ltr_signed(leader_median_delta)}",
-            "",
-        ])
-    buy_delta = buy_hmt - previous[3] if previous else 0
-    sell_delta = sell_hmt - previous[4] if previous else 0
-    lines.extend([
-        f"🟢 خرید: {buy_hmt:.2f} همت | قبل: {buy_delta:.2f} همت",
-        f"🔴 فروش: {sell_hmt:.2f} همت | قبل: {sell_delta:.2f} همت",
-        f"⚖️ اختلاف صف: {imbalance:.2f} همت",
-    ])
-    if turnover is not None:
-        turnover_hmt, turnover_ratio, turnover_status = turnover
-        ratio_text = f"{turnover_ratio:.2f}" if turnover_ratio is not None else "داده کافی نیست"
-        lines.extend([
-            "",
-            f"💧 معاملات امروز: {turnover_hmt:.0f} همت",
-            f"نسبت میانگین معاملات ۳ به ۱۰ روز: {turnover_ratio_text(turnover_ratio)}",
-        ])
-    return "\n".join(lines)
-
-
-def save_market_snapshot(values, now, leader_average=0.0, leader_median=0.0):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (now.isoformat(), *values, leader_average, leader_median))
-        conn.execute("DELETE FROM market_snapshots WHERE timestamp < ?", ((now - timedelta(days=7)).isoformat(),))
-
-
-def previous_market_snapshot(now):
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT count, average, median, buy_value_hmt, sell_value_hmt, leader_average, leader_median FROM market_snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1", (now.isoformat(),)).fetchone()
-    return tuple(row) if row else None
-
-
-def market_group_average_median(stocks):
-    scores = [float(s["score"]) for s in stocks
-              if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
-    return (statistics.mean(scores), statistics.median(scores)) if scores else (0.0, 0.0)
-
-
-
-def build_group_message(title, stocks, now, limit=None):
-    shown = stocks[:limit] if limit else stocks
-    average, deltas = group_stats(shown, now)
-    lines = [f"<b>{html.escape(title)}</b>", f"میانگین {ltr_signed(average)} | قبل {fmt_delta(deltas[0])}", ""]
-    old_scores = previous_scores([s["symbol"] for s in shown], now)
-    for stock in shown:
-        stock["previous_delta"] = stock["score"] - old_scores.get(stock["symbol"], stock["score"])
-    lines.extend(format_report_line(i, stock) for i, stock in enumerate(shown, 1))
-    return "\n".join(lines)
-
-
-def top_leaders_for_chart(leaders, limit=5):
-    """Return the leaders with the highest current scores for the trend chart."""
-    return sorted(leaders, key=lambda stock: float(stock["score"]), reverse=True)[:limit]
-
-
-def top_leveraged_for_chart(leveraged, limit=3):
-    """Return the leveraged funds with the highest current scores for the trend chart."""
-    return sorted(leveraged, key=lambda stock: float(stock["score"]), reverse=True)[:limit]
-
-
-def send_telegram(text, session=None):
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
-    url = f"{TELEGRAM_PROXY.rstrip('/')}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    response = (session or requests).post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data
-
-
-def _chart_points(symbols, now):
-    """Read normal-range historical scores, excluding corrupted outliers."""
-    if not symbols:
-        return []
-    marks = ",".join("?" for _ in symbols)
-    chart_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    # Older rows use a space separator while newer rows use ISO's ``T``.
-    # A separator-free date-time window keeps both formats in the chart.
-    start_text = chart_start.strftime("%Y-%m-%d 09:15:00")
-    end_text = now.strftime("%Y-%m-%dT%H:%M:%S")
-    query = f"""
-        SELECT symbol, score, timestamp
-        FROM history
-        WHERE symbol IN ({marks})
-          AND timestamp >= ? AND timestamp <= ?
-          AND score BETWEEN -20 AND 20
-        ORDER BY timestamp, symbol
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(query, list(symbols) + [start_text, end_text]).fetchall()
-    points = {}
-    for symbol, score, timestamp in rows:
-        points.setdefault(timestamp, {})[symbol] = float(score)
-    return [(timestamp, values) for timestamp, values in sorted(points.items())]
-
-
-def create_score_chart(title, stocks, now, filename, use_broken_axis=False):
-    """Create a normal-scale score trend chart."""
-    from PIL import Image, ImageDraw, ImageFont
-    symbols = [s["symbol"] for s in stocks]
-    points = _chart_points(symbols, now)
-    if not points:
+def calculate_score(last_pct, buy_queue_volume, sell_queue_volume, trade_volume,
+                    allowed_max_pct=None, allowed_min_pct=None):
+    if trade_volume is None or trade_volume <= 0:
         return None
-    width, height = 2400, 1500
-    left, right, top, bottom = 170, 520, 120, 190
-    plot_w = width - left - right
-    colors = ["#1565c0", "#e65100", "#2e7d32", "#c62828", "#6a1b9a", "#00838f", "#ad1457", "#546e7a", "#ef6c00", "#283593"]
-    values = [v for _, row in points for v in row.values()]
-    if not values:
+    if buy_queue_volume and sell_queue_volume:
+        return None  # contradictory order book
+    base = allowed_max_pct if buy_queue_volume else allowed_min_pct if sell_queue_volume else last_pct
+    if base is None:
         return None
-    values_sorted = sorted(values)
-    # Use robust quantiles for the display range so one genuine extreme score
-    # (for example a leader with an unusually large queue) cannot flatten all
-    # other lines. The original values remain in the data; only their pixels
-    # are clipped to the chart edge.
-    def percentile(sorted_values, fraction):
-        position = (len(sorted_values) - 1) * fraction
-        lower = int(position)
-        upper = min(lower + 1, len(sorted_values) - 1)
-        weight = position - lower
-        return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
-    lo = min(percentile(values_sorted, 0.02), 0.0)
-    hi = max(percentile(values_sorted, 0.98), 0.0)
-    padding = max((hi - lo) * 0.08, 0.5)
-    lo -= padding
-    hi += padding
-    panels = [(top + 35, height - bottom, lo, hi)]
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    def font(size):
-        try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-        except OSError: return ImageFont.load_default()
-    draw.rectangle((0, 0, width - 1, height - 1), outline="#bdbdbd", width=3)
-    draw.text((width // 2, 35), title, fill="#111111", font=font(38), anchor="ma")
-    def x_at(i): return left + i * plot_w / max(len(points) - 1, 1)
-    def y_at(value, panel):
-        y0, y1, low, high = panel
-        return y1 - (value - low) * (y1 - y0) / max(high - low, 1e-9)
-    for panel in panels:
-        y0, y1, low, high = panel
-        for tick in range(6):
-            value = high - (high - low) * tick / 5
-            y = int(y0 + (y1 - y0) * tick / 5)
-            draw.line((left, y, left + plot_w, y), fill="#e0e0e0", width=2)
-            draw.text((left - 18, y), f"{value:.1f}", fill="#333333", font=font(24), anchor="rm")
-        draw.line((left, y0, left, y1), fill="#333333", width=4)
-        draw.line((left, y1, left + plot_w, y1), fill="#333333", width=4)
-    def draw_series(symbol, color, panel):
-        segments = []; current = []
-        for i, (_, row) in enumerate(points):
-            if symbol in row:
-                clipped = min(max(row[symbol], panel[2]), panel[3])
-                current.append((int(x_at(i)), int(y_at(clipped, panel))))
-            elif len(current) > 1: segments.append(current); current = []
-        if len(current) > 1: segments.append(current)
-        for segment in segments: draw.line(segment, fill=color, width=6, joint="curve")
-    for idx, symbol in enumerate(symbols):
-        for panel in panels: draw_series(symbol, colors[idx % len(colors)], panel)
-    for panel in panels:
-        y0, y1, low, high = panel
-        median_points = []
-        for i, (_, row) in enumerate(points):
-            vals = [min(max(row[s], low), high) for s in symbols if s in row]
-            if vals: median_points.append((int(x_at(i)), int(y_at(statistics.median(vals), panel))))
-        if len(median_points) > 1: draw.line(median_points, fill="#000000", width=10, joint="curve")
-    if points:
-        label_count = min(8, len(points)); step = max(1, (len(points) - 1) // (label_count - 1))
-        for i in range(0, len(points), step):
-            timestamp = points[i][0]
-            label = timestamp[11:16] if len(timestamp) >= 16 else str(i)
-            draw.line((int(x_at(i)), height - bottom, int(x_at(i)), height - bottom + 12), fill="#333333", width=2)
-            draw.text((int(x_at(i)), height - bottom + 25), label, fill="#333333", font=font(24), anchor="ma")
-    draw.text((left + plot_w // 2, height - 35), "زمان (از ۹:۳۰)", fill="#222222", font=font(28), anchor="ma")
-    draw.text((35, (top + height - bottom) // 2), "نمره", fill="#222222", font=font(28), anchor="mm")
-    legend_y = top + 15
-    for idx, symbol in enumerate(symbols):
-        y = legend_y + idx * 52
-        color = colors[idx % len(colors)]
-        draw.line((width - right + 20, y, width - right + 85, y), fill=color, width=7)
-        draw.text((width - right + 105, y), symbol, fill="#111111", font=font(27), anchor="lm")
-    y = legend_y + len(symbols) * 52
-    draw.line((width - right + 20, y, width - right + 85, y), fill="#000000", width=10)
-    draw.text((width - right + 105, y), "میانه", fill="#111111", font=font(27), anchor="lm")
-    img.save(filename, "PNG", optimize=True)
-    return filename
+    result = base + (buy_queue_volume - sell_queue_volume) / trade_volume
+    return result if math.isfinite(result) else None
 
+class TelegramSender:
+    def __init__(self,token,chat_id,proxy='https://api.telegram.org',session=None):
+        import requests
+        if not token or not chat_id: raise ValueError('Telegram configuration required')
+        self.base=proxy.rstrip('/')+'/bot'+token; self.chat_id=chat_id; self.session=session or requests.Session()
+    def __call__(self,message):
+        if message['kind']=='text':
+            payload=dict(chat_id=self.chat_id,text=message['text'],disable_web_page_preview=True)
+            if message.get('parse_mode'): payload['parse_mode']=message['parse_mode']
+            response=self.session.post(self.base+'/sendMessage',json=payload,timeout=30)
+        else:
+            with open(message['path'],'rb') as image:
+                response=self.session.post(self.base+'/sendPhoto',data=dict(chat_id=self.chat_id,caption=message.get('caption','')),files={'photo':image},timeout=30)
+        data=response.json()
+        if not data.get('ok'): raise RejectedDelivery(data.get('description','Telegram rejected request'))
+        response.raise_for_status()
+        return data
 
-def create_combined_score_chart(leaders, leveraged, now, filename):
-    """Create one normal-scale image with leader and leveraged panels."""
-    from PIL import Image
-    chart_dir = os.path.dirname(filename) or "."
-    leader_path = os.path.join(chart_dir, "._leaders_panel.png")
-    leveraged_path = os.path.join(chart_dir, "._leveraged_panel.png")
-    try:
-        if not create_score_chart("#لیدر - روند نمره ۵ لیدر اصلی", leaders, now, leader_path, use_broken_axis=False):
-            return None
-        if not create_score_chart("#اهرمی - روند نمره ۳ اهرمی اصلی", leveraged, now, leveraged_path, use_broken_axis=False):
-            return None
-        with Image.open(leader_path) as top, Image.open(leveraged_path) as bottom:
-            combined = Image.new("RGB", (max(top.width, bottom.width), top.height + bottom.height), "white")
-            combined.paste(top.convert("RGB"), (0, 0))
-            combined.paste(bottom.convert("RGB"), (0, top.height))
-            combined.save(filename, "PNG", optimize=True)
-        return filename
-    finally:
-        for path in (leader_path, leveraged_path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def _snapshot_points(now):
-    start = now.replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT timestamp, average, median, leader_average, leader_median, buy_value_hmt, sell_value_hmt FROM market_snapshots WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp", (start, now.isoformat())).fetchall()
-    return rows
-
-
-def should_send_market_report(now):
-    """Send the market-status text every two minutes from 09:00."""
-    return (
-        now.minute % 2 == 0
-        and now >= now.replace(hour=9, minute=0, second=0, microsecond=0)
-        and now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
-    )
-
-
-def should_send_market_chart(now):
-    """Send charts and detailed reports every ten minutes from 09:15 through 12:25."""
-    return (
-        (now.hour * 60 + now.minute - (9 * 60 + 15)) % 10 == 0
-        and now >= now.replace(hour=9, minute=15, second=0, microsecond=0)
-        and now <= now.replace(hour=12, minute=25, second=59, microsecond=0)
-    )
-
-
-
-def seconds_until_next_minute(now):
-    """Keep the polling loop aligned so it cannot drift past report minutes."""
-    return max(0.1, 60 - now.second - now.microsecond / 1_000_000)
-
-
-def should_save_snapshot(now):
-    """Persist historical data on ten-minute boundaries."""
-    return now.minute % 10 == 0
-
-
-def save_detailed_snapshot(stocks, now, raw_stocks=None, raw_depth=None):
-    """Save stock, group, industry and compressed raw snapshots, then prune at 31 days."""
-    timestamp = now.isoformat()
-    trading_date = now.date().isoformat()
-    eligible = [s for s in stocks if s.get("eligible_market_stock") and float(s.get("trade_volume", 0)) > 0]
-    stock_rows = [(timestamp, trading_date, s.get("symbol"), s.get("instrument"), s.get("industry"), instrument_type_label(s.get("instrument_type")), s.get("yesterday_price"), s.get("close_price"), s.get("last_price"), s.get("last_pct"), s.get("trade_volume"), s.get("trade_value_toman"), s.get("buy_queue_volume", 0), s.get("sell_queue_volume", 0), s.get("buy_queue_value_toman", 0), s.get("sell_queue_value_toman", 0), s.get("score"), 1) for s in eligible]
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany("INSERT OR REPLACE INTO stock_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", stock_rows)
-        groups = {"کل بازار": eligible, "لیدرها": [s for s in eligible if s.get("symbol") in LEADERS], "اهرمی‌ها": [s for s in eligible if s.get("symbol") in LEVERAGED_FUNDS]}
-        for name, group in groups.items():
-            scores = [float(s["score"]) for s in group]
-            turnover = sum(float(s.get("trade_value_toman", 0)) for s in group)
-            buy = sum(float(s.get("buy_queue_value_toman", 0)) for s in group) / 1e12
-            sell = sum(float(s.get("sell_queue_value_toman", 0)) for s in group) / 1e12
-            conn.execute("INSERT OR REPLACE INTO group_snapshots VALUES (?,?,?,?,?,?,?,?,?)", (timestamp, name, len(scores), statistics.mean(scores) if scores else 0, statistics.median(scores) if scores else 0, turnover, buy, sell, buy-sell))
-        industry_groups = defaultdict(list)
-        for s in eligible:
-            if s.get("industry"):
-                industry_groups[s["industry"]].append(s)
-        for industry, group in industry_groups.items():
-            scores = [float(s["score"]) for s in group]
-            turnover = sum(float(s.get("trade_value_toman", 0)) for s in group)
-            buy = sum(float(s.get("buy_queue_value_toman", 0)) for s in group) / 1e12
-            sell = sum(float(s.get("sell_queue_value_toman", 0)) for s in group) / 1e12
-            conn.execute("INSERT OR REPLACE INTO industry_detail_snapshots VALUES (?,?,?,?,?,?,?,?,?)", (timestamp, industry, len(scores), statistics.mean(scores), statistics.median(scores), turnover, buy, sell, buy-sell))
-        cutoff = (now - timedelta(days=31)).isoformat()
-        for table in ("stock_snapshots", "group_snapshots", "industry_detail_snapshots", "raw_tse_snapshots"):
-            conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
-        conn.execute("DELETE FROM daily_stock_summary WHERE trading_date < ?", ((now - timedelta(days=31)).date().isoformat(),))
-        conn.execute("DELETE FROM daily_market_summary WHERE trading_date < ?", ((now - timedelta(days=31)).date().isoformat(),))
-        rows = conn.execute("SELECT trading_date, symbol, MAX(industry), COUNT(*), MAX(trade_volume), MAX(trade_value_toman), AVG(score), MIN(score), MAX(score), MAX(buy_queue_value_toman), MAX(sell_queue_value_toman) FROM stock_snapshots WHERE trading_date = ? GROUP BY trading_date, symbol", (trading_date,)).fetchall()
-        conn.executemany("INSERT OR REPLACE INTO daily_stock_summary(trading_date,symbol,industry,snapshot_count,final_volume,final_turnover_toman,average_score,median_score,min_score,max_score,last_score,max_buy_queue_toman,max_sell_queue_toman) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [(r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[6],r[7],r[8],r[8],r[9],r[10]) for r in rows])
-        latest = conn.execute("SELECT score, trade_value_toman, buy_queue_value_toman, sell_queue_value_toman FROM stock_snapshots WHERE trading_date = ? AND timestamp = (SELECT MAX(timestamp) FROM stock_snapshots WHERE trading_date = ?)", (trading_date,trading_date)).fetchall()
-        if latest:
-            scores=[r[0] for r in latest]; buy=sum(r[2] for r in latest)/1e12; sell=sum(r[3] for r in latest)/1e12
-            snapshot_count = conn.execute("SELECT COUNT(DISTINCT timestamp) FROM stock_snapshots WHERE trading_date = ?", (trading_date,)).fetchone()[0]
-            conn.execute("INSERT OR REPLACE INTO daily_market_summary VALUES (?,?,?,?,?,?,?,?,?,?,?)", (trading_date, snapshot_count, len(latest), sum(scores)/len(scores), statistics.median(scores), sum(r[1] for r in latest), buy, sell, buy-sell, buy-sell, None))
-    raw_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "raw_tse")
-    cutoff_date = (now - timedelta(days=31)).date()
-    if os.path.isdir(raw_dir):
-        for filename in os.listdir(raw_dir):
-            if not filename.endswith(".json.gz"):
-                continue
-            try:
-                file_date = datetime.strptime(filename[:15], "%Y%m%dT%H%M%S").date()
-            except ValueError:
-                continue
-            if file_date < cutoff_date:
-                try:
-                    os.remove(os.path.join(raw_dir, filename))
-                except OSError:
-                    logging.warning("Could not remove expired raw file: %s", filename)
-    if raw_stocks is not None and raw_depth is not None:
-        raw_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "raw_tse")
-        os.makedirs(raw_dir, exist_ok=True)
-        stamp = now.strftime("%Y%m%dT%H%M%S")
-        paths = []
-        for label, payload in (("stocks", raw_stocks), ("depth", raw_depth)):
-            path = os.path.join(raw_dir, f"{stamp}_{label}.json.gz")
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            with gzip.open(path, "wb", compresslevel=6) as fh: fh.write(data)
-            paths.append((path, len(data), hashlib.sha256(data).hexdigest()))
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT OR REPLACE INTO raw_tse_snapshots VALUES (?,?,?,?,?,?,?,?)", (timestamp, trading_date, paths[0][0], paths[1][0], paths[0][1], paths[1][1], paths[0][2], paths[1][2]))
-
-
-
-def create_market_charts(now, chart_dir):
-    from PIL import Image, ImageDraw, ImageFont
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-
-        def rtl(text):
-            return get_display(arabic_reshaper.reshape(str(text)))
-    except ImportError:
-        def rtl(text):
-            return str(text)
-
-    rows = _snapshot_points(now)
-    if len(rows) < 2:
-        return []
-    os.makedirs(chart_dir, exist_ok=True)
-    font_paths = [
-        "C:/Windows/Fonts/tahoma.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    def font(size):
-        for font_path in font_paths:
-            try:
-                return ImageFont.truetype(font_path, size)
-            except OSError:
-                continue
-        return ImageFont.load_default()
-    colors = ["#1565c0", "#d84315", "#2e7d32", "#8e24aa"]
-    labels = ["میانه کل بازار", "میانه لیدرها"]
-    times = [r[0] for r in rows]
-    def render(title, series, legend, path, ylabel):
-        width, height = 2200, 1250; left, right, top, bottom = 150, 430, 120, 180
-        pw, ph = width-left-right, height-top-bottom
-        vals = [v for line in series for v in line]; low, high = min(vals), max(vals)
-        pad = max((high-low)*.12, 1); low -= pad; high += pad
-        img = Image.new("RGB", (width,height), "white"); draw=ImageDraw.Draw(img)
-        def x(i): return left + i*pw/max(len(rows)-1,1)
-        def y(v): return top + (high-v)*ph/max(high-low,1e-9)
-        draw.rectangle((0,0,width-1,height-1), outline="#bdbdbd", width=3)
-        draw.text((width//2,35), rtl(title), fill="#111", font=font(38), anchor="ma")
-        for k in range(7):
-            val=high-(high-low)*k/6; yy=int(top+ph*k/6)
-            draw.line((left,yy,left+pw,yy), fill="#e0e0e0", width=2); draw.text((left-18,yy),f"{val:.1f}",fill="#333",font=font(23),anchor="rm")
-        for j,line in enumerate(series):
-            draw.line([(int(x(i)),int(y(v))) for i,v in enumerate(line)], fill=colors[j], width=7, joint="curve")
-        step=max(1,(len(rows)-1)//7)
-        for i in range(0,len(rows),step):
-            draw.text((int(x(i)),height-bottom+25),times[i][11:16],fill="#333",font=font(24),anchor="ma")
-        draw.text((left+pw//2,height-35),rtl("زمان"),fill="#222",font=font(28),anchor="ma"); draw.text((35,(top+height-bottom)//2),rtl(ylabel),fill="#222",font=font(28),anchor="mm")
-        for j,name in enumerate(legend):
-            yy=top+15+j*58; draw.line((width-right+20,yy,width-right+85,yy),fill=colors[j],width=8); draw.text((width-right+105,yy),rtl(name),fill="#111",font=font(27),anchor="lm")
-        img.save(path,"PNG",optimize=True); return path
-    # Columns are: timestamp, market average, market median,
-    # leader average, leader median, buy queue, sell queue.
-    score_path = render(
-        "#وضعیت بازار - روند میانه نمره",
-        [
-            [r[2] for r in rows],
-            [r[4] for r in rows],
-        ],
-        labels,
-        os.path.join(chart_dir, "market_scores.png"),
-        "نمره",
-    )
-    return [score_path]
-
-
-def send_telegram_photo(filename, caption, session=None):
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
-    url = f"{TELEGRAM_PROXY.rstrip('/')}/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    with open(filename, "rb") as image:
-        response = (session or requests).post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"photo": image}, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data
-
-
-def run_pipeline(session=None, now=None):
-    now = now or datetime.now(TEHRAN)
-    send_market_report = should_send_market_report(now)
-    send_detailed_reports = should_send_market_chart(now)
-    stocks_raw, depth_raw = fetch_market_data(session)
-    data = parse_market_data(stocks_raw, depth_raw)
-    stock_dict = {s["symbol"]: s for s in data}
-    leveraged = sorted((stock_dict[s] for s in LEVERAGED_FUNDS if s in stock_dict), key=lambda s: s["score"], reverse=True)
-    leaders = sorted((stock_dict[s] for s in LEADERS if s in stock_dict), key=lambda s: s["score"], reverse=True)
-    if not leveraged and not leaders:
-        logging.warning("No configured symbols found in TSETMC data")
-        return 0
-    init_db()
-    persist_snapshot = should_save_snapshot(now)
-    if persist_snapshot:
-        save_scores(data, now)
-
-    # Group reports must not wait for the optional/slow industry lookup.
-    # A TSE sector API/cache failure should not suppress #اهرمی and #لیدر.
-    market_values = market_summary_values(data)
-    market_previous = previous_market_snapshot(now)
-    leader_average, leader_median = market_group_average_median(leaders)
-    turnover = update_daily_turnover(data, now)
-    if persist_snapshot:
-        save_market_snapshot(market_values, now, leader_average, leader_median)
-    if send_market_report:
-        send_telegram(market_summary(data, market_previous, (leader_average, leader_median), turnover), session)
-    if send_detailed_reports:
-        send_telegram(build_group_message("#اهرمی", leveraged, now), session)
-        send_telegram(build_group_message("#لیدر", leaders, now, limit=10), session)
-
-    # Industry enrichment is optional and must happen after the group reports.
-    attach_industries(data, session)
-    industry_values = {item["industry"]: item["median"] for item in industry_stats(data)}
-    industry_message = build_industry_message(data, now, limit=5)
-    if persist_snapshot:
-        save_industry_snapshot(industry_values, now)
-        save_detailed_snapshot(data, now, stocks_raw, depth_raw)
-    if send_detailed_reports:
-        send_telegram(industry_message, session)
-    if send_detailed_reports:
-        chart_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "charts")
-        os.makedirs(chart_dir, exist_ok=True)
-        chart_leveraged = top_leveraged_for_chart(leveraged)
-        chart_leaders = top_leaders_for_chart(leaders)
-        leveraged_chart = create_score_chart("#اهرمی - روند نمره ۳ اهرمی برتر", chart_leveraged, now, os.path.join(chart_dir, "leveraged.png"))
-        leaders_chart = create_score_chart("#لیدر - روند نمره ۵ لیدر برتر", chart_leaders, now, os.path.join(chart_dir, "leaders.png"))
-        if leveraged_chart:
-            send_telegram_photo(leveraged_chart, "#اهرمی - نمودار روند نمره", session)
-        if leaders_chart:
-            send_telegram_photo(leaders_chart, "#لیدر - نمودار روند نمره", session)
-        market_charts = create_market_charts(now, chart_dir)
-        for chart, caption in zip(market_charts, ("#وضعیت بازار - ۲ روند میانه نمره",)):
-            send_telegram_photo(chart, caption, session)
-
-    return len(data)
-
-
-def is_market_open(now=None):
-    now = now or datetime.now(TEHRAN)
-    return now.weekday() not in (3, 4) and now.replace(hour=9, minute=0, second=0, microsecond=0) <= now <= now.replace(hour=12, minute=30, second=59, microsecond=0)
-
-
-def main():
-    init_db()
-    logging.info("Bourse Alert Bot started")
+def serve(store,metadata,output_dir,fetcher=None,clock=None,sender=None,once=False,metadata_path=None):
+    import time
+    fetcher=fetcher or fetch_market_data; clock=clock or (lambda:datetime.now(TEHRAN))
     while True:
+        now=clock()
         try:
-            if is_market_open():
-                run_pipeline()
-                time.sleep(seconds_until_next_minute(datetime.now(TEHRAN)))
-            else:
-                time.sleep(60)
-        except Exception:
-            logging.exception("Pipeline failed")
-            time.sleep(30)
+            with store.connect() as c: finalized=c.execute('SELECT 1 FROM v2_days WHERE day=? AND complete=1',(str(now.date()),)).fetchone()
+            poll=now.weekday() not in (3,4) and ((8,50)<=(now.hour,now.minute)<=(12,25) or (13<=now.hour<18 and not finalized))
+            if poll:
+                packet=fetcher()
+                now=clock()
+                tick(store,now,lambda:packet,metadata,output_dir,sender)
+                if sender: retry_pending(store,sender)
+                next_slots=[s for s in report_slots(now.date()) if s>clock()]
+                headroom=(next_slots[0]-clock()).total_seconds() if next_slots else 3600
+                if metadata_path and headroom>45:
+                    metadata=convert_metadata(refresh_metadata(metadata_path,parse_market_data(packet['stocks'],packet.get('depth'),metadata),now,limit=2))
 
+        except Exception: logging.exception('Pipeline failed')
+        if once: return
+        time.sleep(max(1,60-clock().second))
 
-def send_current_market_summary():
-    stocks_raw, depth_raw = fetch_market_data()
-    data = parse_market_data(stocks_raw, depth_raw)
-    values = market_summary_values(data)
-    now = datetime.now(TEHRAN)
-    previous = previous_market_snapshot(now)
-    stock_dict = {s["symbol"]: s for s in data}
-    leaders = [stock_dict[s] for s in LEADERS if s in stock_dict]
-    leader_stats = market_group_average_median(leaders)
-    init_db()
-    turnover = update_daily_turnover(data, now)
-    message = market_summary(data, previous, leader_stats, turnover)
-    result = send_telegram(message)
-    save_market_snapshot(values, now, *leader_stats)
-    return result
+def cli(argv=None):
+    import argparse
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--preview',metavar='MANIFEST')
+    parser.add_argument('--metadata')
+    parser.add_argument('--db',default='scores_history.db')
+    parser.add_argument('--output',default='charts')
+    parser.add_argument('--repair-legacy',action='store_true')
+    parser.add_argument('--run',action='store_true')
+    parser.add_argument('--once',action='store_true')
+    parser.add_argument('--send',action='store_true',help='Explicitly enable Telegram delivery (never used for preview)')
+    args=parser.parse_args(argv)
+    store=Store(args.db)
+    if args.repair_legacy: print('repaired',repair_legacy_summaries(store))
+    metadata=convert_metadata(json.loads(Path(args.metadata).read_text(encoding='utf-8'))) if args.metadata else {}
+    if args.preview:
+        count=replay_archive(store,args.preview,metadata)
+        manifest=json.loads(Path(args.preview).read_text(encoding='utf-8'))
+        day=max(datetime.fromisoformat(e['timestamp']).date() for e in manifest)
+        points=store.points(day)
+        if not points: raise ValueError('no usable archive snapshots')
+        now,summary=points[-1]; generate_reports(store,now,summary,args.output,historical=True)
+        Path(args.output,'incident.json').write_text(json.dumps(store.incident(now)['by_symbol'],ensure_ascii=False,indent=2),encoding='utf-8')
+        print(json.dumps(dict(replayed=count,timestamp=now.isoformat(),count=summary['count'],median=summary['median'],messages=5)))
+        return 0
+    if args.repair_legacy: return 0
+    if args.run:
+        import os
+        logging.basicConfig(level=logging.INFO,format='%(asctime)s [%(levelname)s] %(message)s')
+        sender=TelegramSender(os.environ.get('TELEGRAM_BOT_TOKEN'),os.environ.get('TELEGRAM_CHAT_ID'),os.environ.get('TELEGRAM_PROXY','https://api.telegram.org')) if args.send else None
+        serve(store,metadata,args.output,sender=sender,once=args.once,metadata_path=args.metadata or str(Path(args.db).parent/'metadata.json'))
+        return 0
+    parser.error('specify --preview or --repair-legacy; live mode requires explicit --run')
 
-
-if __name__ == "__main__":
-    if "--market-summary" in os.sys.argv:
-        send_current_market_summary()
-    else:
-        main()
+if __name__=='__main__':
+    raise SystemExit(cli())
