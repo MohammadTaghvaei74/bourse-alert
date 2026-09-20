@@ -248,14 +248,22 @@ def chart_series(store,now,summary):
     out['industries']={g['industry']:[next((h['median'] for h in points.get(t,{}).get('all_industries',[]) if h['industry']==g['industry']),None) for t in times] for g in summary['industries']}
     return out
 
+def chart_text(text,native_shaping=None):
+    """Shape once: Matplotlib 3.11+ handles logical Unicode natively."""
+    if native_shaping is None:
+        import matplotlib
+        native_shaping=tuple(int(v) for v in matplotlib.__version__.split('.')[:2]) >= (3,11)
+    if native_shaping: return str(text)
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    return get_display(arabic_reshaper.reshape(str(text)))
+
 def generate_reports(store,now,summary,output_dir,historical=False):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    def rtl(s): return get_display(arabic_reshaper.reshape(str(s)))
+    rtl=chart_text
     output_dir=Path(output_dir); output_dir.mkdir(parents=True,exist_ok=True)
     stamp=('نمونه تاریخی — ' if historical else '')+now.strftime('%Y-%m-%d %H:%M')+' تهران'
     series=chart_series(store,now,summary); times=series['times']
