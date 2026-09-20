@@ -113,6 +113,36 @@ def fetch_market_data(session=None):
     if len(parts)<4 or not parts[2]: raise ValueError('unexpected MarketWatch structure')
     return dict(market_date=market_date,asof=f'{asof[:2]}:{asof[2:4]}:{asof[4:]}',stocks=parts[2].split(';'),depth=parts[3].split(';'),closed=all(o.get('marketState')=='F' for o in overview))
 
+def decorate_report(text):
+    """Add stable visual markers without changing report data or RTL marks."""
+    prefixes = {
+        '#وضعیت_بازار': '📊', '#صنایع_برتر': '🏭',
+        '#روند_بازار': '📈', '#روند_صنایع': '🏭', '#تمایل_بازار': '⚖️',
+        '#اهرمی': '🚀', '#لیدر': '👑',
+        'میانه نمره بازار:': '🎯', 'روند ارزش معاملات': '💹',
+        'خالص صف /': '⚖️', 'صف خرید:': '🟢',
+        'تمایل بازار به': '🧭', 'سهام معامله‌شده:': '🔎',
+        'میانگین ': '📊', 'صنعتی با میانه غیرمنفی': 'ℹ️',
+    }
+    lines = []
+    for line in text.split('\n'):
+        for prefix, icon in prefixes.items():
+            if line.startswith(prefix) or line.startswith('<b>' + prefix):
+                line = icon + ' ' + line
+                break
+        else:
+            if len(line) >= 10 and line[:4].isdigit() and line[4] == '-':
+                line = '🕒 ' + line
+            elif line.startswith('نمونه تاریخی — '):
+                line = '🕒 ' + line
+            elif ' | میانه ' in line:
+                line = '🏭 ' + line
+        line = line.replace('| صف فروش:', '| 🔴 صف فروش:')
+        line = line.replace('| روز کامل پیشین:', '| 🗓 روز کامل پیشین:')
+        lines.append(line)
+    return '\n'.join(lines)
+
+
 def legacy_reports(store,stocks,now,output_dir):
     """Keep deployed step3 rendering isolated; never apply its filters to v2."""
     with store.connect() as c:
@@ -134,6 +164,9 @@ def legacy_reports(store,stocks,now,output_dir):
     for key,title,rows in [('leveraged','#اهرمی',legacy.top_leveraged_for_chart(funds)),('leaders','#لیدر',legacy.top_leaders_for_chart(leaders))]:
         chart=legacy.create_score_chart(title,rows,now,str(Path(output_dir)/(key+'.png')))
         if chart: messages.append(dict(key='legacy_'+key+'_photo',kind='photo',path=chart,caption=title))
+    for message in messages:
+        field = 'text' if message['kind'] == 'text' else 'caption'
+        message[field] = decorate_report(message.get(field, ''))
     with store.connect() as c: c.execute('INSERT OR REPLACE INTO v2_legacy VALUES (?,?)',(now.isoformat(),json.dumps(messages,ensure_ascii=False)))
     gc.collect()
     return messages
@@ -310,6 +343,9 @@ def generate_reports(store,now,summary,output_dir,historical=False):
             industry_lines.append(f"{i}. {s['symbol']} | {fmt(s['score'])} | {market} | Incident {fmt(inc.get('median'))} ({inc.get('count',0)} نمره؛ {'ناقص' if inc.get('partial',True) else 'کامل'})")
     if not summary['industries']: industry_lines.append('صنعتی با میانه غیرمنفی وجود ندارد')
     messages=[dict(key='market_text',kind='text',text=text),dict(key='market_panels',kind='photo',path=str(p1),caption='#روند_بازار '+stamp),dict(key='industry_text',kind='text',text='\n'.join(industry_lines)),dict(key='industries',kind='photo',path=str(p2),caption='#روند_صنایع '+stamp),dict(key='allocation',kind='photo',path=str(p3),caption='#تمایل_بازار '+stamp)]
+    for message in messages:
+        field = 'text' if message['kind'] == 'text' else 'caption'
+        message[field] = decorate_report(message.get(field, ''))
     (output_dir/'messages.json').write_text(json.dumps(messages,ensure_ascii=False,indent=2),encoding='utf-8')
     return messages
 
