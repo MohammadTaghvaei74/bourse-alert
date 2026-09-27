@@ -16,6 +16,10 @@ def test_common_stock_filter_includes_non_n1_n2_shares_and_excludes_non_stocks()
     assert not main.is_common_stock("خودروح", "حق تقدم شرکت", "N1")
 
 
+def test_leveraged_funds_include_the_market_symbol_for_narenj():
+    assert "نارنج اهرم" in main.LEVERAGED_FUNDS
+
+
 def test_status_stars_uses_filled_and_hollow_five_star_scale():
     assert status_stars("عالی") == "⭐⭐⭐⭐⭐"
     assert status_stars("خوب") == "⭐⭐⭐⭐☆"
