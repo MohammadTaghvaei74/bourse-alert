@@ -124,6 +124,7 @@ def test_sell_queue_score_is_subtracted():
 
 def test_queue_value_is_integer_billion_toman():
     assert queue_value_billion_toman(5_000, 20_000_000) == 10
+    assert queue_value_billion_toman(5_000, 67_600_000) == 34
 
 
 def test_line_omits_queue_when_there_is_no_queue():

@@ -33,7 +33,9 @@ def calculate_score(last_pct, buy_queue_volume, sell_queue_volume, trade_volume)
 
 def queue_value_billion_toman(price, volume):
     # TSE prices and values are in rials; divide by 10 for tomans.
-    return int(float(price) * float(volume) / 10 / 1_000_000_000)
+    # Keep the queue column integer-only, but round to the nearest billion
+    # instead of truncating the fractional part.
+    return round(float(price) * float(volume) / 10 / 1_000_000_000)
 
 
 def ltr_signed(value, decimals=1):
